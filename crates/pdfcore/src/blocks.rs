@@ -573,17 +573,32 @@ fn accepts(blk: &Open, last: &Line, line: &Line, size: f32, gap: f32, opts: &Blo
     aligns(blk, last, line, size, opts)
 }
 
-/// Одинаковы ли гарнитура и начертание у преобладающих ранов двух строк.
+/// Одинаковы ли гарнитура и начертание у двух соседних строк.
+///
+/// Сначала сравниваются преобладающие раны. Если они разошлись, решает стык:
+/// полужирная шапка абзаца — «Рис. 1.2 | The New York Times, 7 июля 1958» —
+/// нередко переваливает через перенос строки, и тогда первая строка целиком
+/// полужирная, а вторая в основном обычная. Совпадающее оформление по обе
+/// стороны переноса значит, что это один продолжающийся кусок текста, а не
+/// заголовок над абзацем: у заголовка стык рвётся — он кончается одним
+/// начертанием, а тело начинается другим.
 ///
 /// Сравнивается имя семейства без префикса подмножества, признак полужирного и
 /// курсив. Цвет намеренно не учитывается: выделить слово цветом внутри абзаца —
 /// обычное дело, и разрывать из-за этого абзац неправильно.
 fn same_typeface(a: &Line, b: &Line) -> bool {
+    fn matches(a: &crate::model::Style, b: &crate::model::Style) -> bool {
+        a.clean_family() == b.clean_family() && a.is_bold() == b.is_bold() && a.italic == b.italic
+    }
     match (a.dominant_style(), b.dominant_style()) {
-        (Some(a), Some(b)) => {
-            a.clean_family() == b.clean_family()
-                && a.is_bold() == b.is_bold()
-                && a.italic == b.italic
+        (Some(da), Some(db)) => {
+            if matches(da, db) {
+                return true;
+            }
+            match (a.runs.last(), b.runs.first()) {
+                (Some(last), Some(first)) => matches(&last.style, &first.style),
+                _ => false,
+            }
         }
         // Строка без ранов ничего не утверждает об оформлении.
         _ => true,
@@ -1087,6 +1102,51 @@ mod tests {
         );
         assert_eq!(blocks[0].text(), "1. THE PERCEPTRON");
         assert_eq!(blocks[1].lines.len(), 2);
+    }
+
+    #[test]
+    fn a_bold_lead_crossing_the_line_break_keeps_one_paragraph() {
+        // Подпись с полужирной шапкой, переваливающей через перенос: «Рис.
+        // 1.2 | The New York Times, 7» кончается полужирным, и «июля 1958»
+        // следующей строки им же начинается — дальше обычный текст. Стык
+        // одного начертания говорит, что это один абзац, хотя преобладающие
+        // стили строк разные.
+        let bold = Style {
+            weight: 700,
+            ..Default::default()
+        };
+
+        let runs = vec![
+            styled(
+                "Рис. 1.2 | The New York Times, 7",
+                60.0,
+                700.0,
+                180.0,
+                11.0,
+                bold.clone(),
+            ),
+            styled("июля 1958", 60.0, 686.0, 55.0, 11.0, bold),
+            styled(
+                ". Персептрон потряс мир в 1950-х",
+                116.0,
+                686.0,
+                124.0,
+                11.0,
+                Style::default(),
+            ),
+            styled(
+                "распознавать образы полностью",
+                60.0,
+                672.0,
+                175.0,
+                11.0,
+                Style::default(),
+            ),
+        ];
+
+        let blocks = detect_blocks(runs, &BlockOptions::default());
+        assert_eq!(blocks.len(), 1, "подпись развалилась: {blocks:#?}");
+        assert_eq!(blocks[0].lines.len(), 3);
     }
 
     #[test]

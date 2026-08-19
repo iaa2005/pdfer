@@ -74,8 +74,19 @@ impl Workspace {
             .pt_8()
             .pb_2()
             // Знак вместо набранного названия: рисуется растром, готовым при
-            // сборке из `logo.svg`.
-            .child(img("images/logo.png").h(px(LOGO_HEIGHT)).w(px(LOGO_WIDTH)))
+            // сборке из `logo.svg`. Под ним — подпись автора, приглушённая:
+            // читается, когда её ищут, и не спорит со знаком.
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(img("images/logo.png").h(px(LOGO_HEIGHT)).w(px(LOGO_WIDTH)))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground.opacity(0.55))
+                            .child("by @iaa2005"),
+                    ),
+            )
             .child(
                 Button::new("open-document")
                     .primary()

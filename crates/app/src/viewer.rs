@@ -390,6 +390,10 @@ pub(crate) struct Document {
     /// Последний отправленный список — чтобы не дёргать поток рендера
     /// одинаковыми запросами на каждый кадр.
     requested: Vec<TileKey>,
+    /// Страницы, чьи растры устарели после правки, но ещё показываются:
+    /// выбрасывать старый растр до прихода нового — это белая вспышка на
+    /// месте страницы при каждом «Применить».
+    stale_pages: HashSet<u32>,
     /// Ключ миниатюры первой страницы: по нему узнаётся тайл, который стоит
     /// сохранить на диск для стартовой страницы.
     thumb_key_page0: Option<TileKey>,
@@ -685,6 +689,7 @@ impl Viewer {
             tiles: TileCache::new(DEFAULT_TILE_BUDGET),
             blocks: HashMap::new(),
             blocks_requested: HashSet::new(),
+            stale_pages: HashSet::new(),
             zoom: 1.0,
             rotation: Rotation::None,
             show_blocks: false,
@@ -718,8 +723,19 @@ impl Viewer {
                         }
                     }
                     let bytes = bitmap.pixels.len();
+                    // Первый свежий растр правленой страницы вытесняет все её
+                    // старые: они рисовали ещё непоправленный текст.
+                    let mut evicted = if doc.stale_pages.remove(&key.page) {
+                        doc.tiles.invalidate_page(key.page)
+                    } else {
+                        Vec::new()
+                    };
+                    let bytes_len = bytes;
                     match to_texture(bitmap) {
-                        Some(texture) => doc.tiles.insert(key, texture, bytes),
+                        Some(texture) => {
+                            evicted.extend(doc.tiles.insert(key, texture, bytes_len));
+                            evicted
+                        }
                         None => Vec::new(),
                     }
                 }
@@ -752,12 +768,16 @@ impl Viewer {
                         None => tracing::info!(page, "блок переставлен без перенабора"),
                     }
                     doc.dirty = true;
-                    // Страница изменилась: её растры и разбор устарели.
+                    // Страница изменилась: её растры и разбор устарели. Но
+                    // старый растр продолжает показываться, пока не придёт
+                    // новый, — иначе страница на мгновение белеет при каждом
+                    // применении правки.
                     doc.blocks.remove(&page);
                     doc.blocks_requested.remove(&page);
                     doc.requested.clear();
+                    doc.stale_pages.insert(page);
                     doc.renderer.request_blocks(page);
-                    doc.tiles.invalidate_page(page)
+                    Vec::new()
                 }
                 RenderEvent::Styles { styles, changed } => {
                     if changed {
@@ -944,7 +964,9 @@ impl Viewer {
         };
         for page in start..(first + ahead + 1).min(count) {
             let key = doc.page_key(page, scale_factor);
-            if !doc.tiles.contains(&key) {
+            // Устаревшая после правки страница просится заново, хотя её
+            // старый растр ещё в кэше: он показывается до прихода свежего.
+            if !doc.tiles.contains(&key) || doc.stale_pages.contains(&page) {
                 wanted.push(key);
             }
         }
@@ -956,7 +978,7 @@ impl Viewer {
         let thumb_first = (doc.thumbs.logical_scroll_top().item_ix as u32).min(count - 1);
         for page in thumb_first..(thumb_first + THUMB_PREFETCH).min(count) {
             if let Some(key) = doc.thumbnail_key(page, scale_factor)
-                && !doc.tiles.contains(&key)
+                && (!doc.tiles.contains(&key) || doc.stale_pages.contains(&page))
             {
                 wanted.push(key);
             }

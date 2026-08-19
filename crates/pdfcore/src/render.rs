@@ -11,7 +11,7 @@
 //! актуальность, просто не доживают до исполнения. Уже отрисованный тайл
 //! отдаётся всегда, даже если вьюпорт успел уехать, — он пригодится в кэше.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -456,6 +456,15 @@ fn worker(
     let mut marked: Option<bool> = None;
     // Одностраничная выжимка для показа правки по ходу набора.
     let mut preview: Option<Preview> = None;
+    // Накладки: правленые страницы, перечитанные растеризатором поодиночке.
+    //
+    // Полная перечитка после каждой правки не по карману: сериализация
+    // двухсотмегабайтной книги занимает секунды, и на это время встаёт вся
+    // очередь — от растров до показа набора. Правка меняет ровно одну
+    // страницу, поэтому растеризатору отдаётся её одностраничная выжимка, а
+    // основной документ остаётся от исходного файла. Целиком документ
+    // пересобирается только там, где меняется состав страниц.
+    let mut overlays: HashMap<u32, PdfDocument<'static>> = HashMap::new();
     // История правок для отката. Правка меняет ровно одну страницу, поэтому
     // шаг истории — это пара «поток содержимого до и после». Дёшево: страница
     // книги — доли мегабайта, сто шагов помещаются без раздумий.
@@ -491,7 +500,7 @@ fn worker(
         };
 
         let event = match job {
-            Job::Tile(key) => match render_tile(&document, key) {
+            Job::Tile(key) => match render_tile(page_in(&document, &overlays, key.page), key) {
                 Ok(bitmap) => RenderEvent::Tile {
                     key,
                     bitmap: Arc::new(bitmap),
@@ -501,7 +510,7 @@ fn worker(
                     message: e.to_string(),
                 },
             },
-            Job::Blocks(page) => match read_blocks(&document, page) {
+            Job::Blocks(page) => match read_blocks(page_in(&document, &overlays, page)) {
                 Ok(blocks) => {
                     let blocks = split_by_marks(blocks, page, &path, &mut source, &mut marked);
                     RenderEvent::Blocks { page, blocks }
@@ -552,7 +561,12 @@ fn worker(
                 let page = request.page_number().saturating_sub(1);
                 // Страница изменилась — заготовка для показа устарела.
                 preview = None;
-                match apply_edit(&path, &mut source, &mut document, &request, &mut history) {
+                let result =
+                    apply_edit(&path, &mut source, &request, &mut history).and_then(|outcome| {
+                        refresh_overlay(&path, &mut source, &mut overlays, request.page_number())?;
+                        Ok(outcome)
+                    });
+                match result {
                     Ok(outcome) => RenderEvent::Edited { page, outcome },
                     Err(e) => RenderEvent::Failed {
                         page: Some(page),
@@ -561,12 +575,12 @@ fn worker(
                 }
             }
             Job::EditBatch(edits) => {
-                let page = edits
-                    .first()
-                    .map(|edit| edit.page_number().saturating_sub(1))
-                    .unwrap_or(0);
+                let page_number = edits.first().map(|edit| edit.page_number()).unwrap_or(1);
+                let page = page_number.saturating_sub(1);
                 preview = None;
-                match apply_batch(&path, &mut source, &mut document, &edits, &mut history) {
+                let result = apply_batch(&path, &mut source, &edits, &mut history)
+                    .and_then(|()| refresh_overlay(&path, &mut source, &mut overlays, page_number));
+                match result {
                     Ok(()) => RenderEvent::Edited {
                         page,
                         outcome: None,
@@ -580,7 +594,11 @@ fn worker(
             Job::Page(op) => {
                 preview = None;
                 match run_page_op(&path, &mut source, &mut document, &op, &mut history) {
-                    Ok(info) => RenderEvent::PagesChanged { info },
+                    Ok(info) => {
+                        // Номера страниц съехали — накладки прибиты к старым.
+                        overlays.clear();
+                        RenderEvent::PagesChanged { info }
+                    }
                     Err(e) => RenderEvent::Failed {
                         page: Some(op.page_number().saturating_sub(1)),
                         message: format!("{e:#}"),
@@ -589,7 +607,22 @@ fn worker(
             }
             Job::Undo => {
                 preview = None;
-                match step_history(&path, &mut source, &mut document, &mut history, true) {
+                let result = step_history(&path, &mut source, &mut document, &mut history, true)
+                    .and_then(|outcome| {
+                        match outcome {
+                            // Шаг тронул содержимое страницы — её накладка
+                            // пересобирается, остальные верны как были.
+                            Some(StepOutcome::Content(page)) => {
+                                refresh_overlay(&path, &mut source, &mut overlays, page + 1)?;
+                            }
+                            // Состав страниц другой — накладки прибиты к
+                            // старым номерам.
+                            Some(StepOutcome::Pages(_)) => overlays.clear(),
+                            None => {}
+                        }
+                        Ok(outcome)
+                    });
+                match result {
                     Ok(Some(StepOutcome::Content(page))) => RenderEvent::Edited {
                         page,
                         outcome: None,
@@ -607,7 +640,22 @@ fn worker(
             }
             Job::Redo => {
                 preview = None;
-                match step_history(&path, &mut source, &mut document, &mut history, false) {
+                let result = step_history(&path, &mut source, &mut document, &mut history, false)
+                    .and_then(|outcome| {
+                        match outcome {
+                            // Шаг тронул содержимое страницы — её накладка
+                            // пересобирается, остальные верны как были.
+                            Some(StepOutcome::Content(page)) => {
+                                refresh_overlay(&path, &mut source, &mut overlays, page + 1)?;
+                            }
+                            // Состав страниц другой — накладки прибиты к
+                            // старым номерам.
+                            Some(StepOutcome::Pages(_)) => overlays.clear(),
+                            None => {}
+                        }
+                        Ok(outcome)
+                    });
+                match result {
                     Ok(Some(StepOutcome::Content(page))) => RenderEvent::Edited {
                         page,
                         outcome: None,
@@ -673,6 +721,8 @@ fn worker(
                 ) {
                     Ok((restyled, info)) => {
                         tracing::info!(style = def.id, blocks = restyled, "стиль применён");
+                        // Каскад мог тронуть много страниц — накладки не в счёт.
+                        overlays.clear();
                         RenderEvent::PagesChanged { info }
                     }
                     Err(e) => RenderEvent::Failed {
@@ -705,7 +755,12 @@ fn worker(
                     },
                 }
             }
-            Job::Save(target) => match save_document(&mut source, &mut document, &path, &target) {
+            Job::Save(target) => match save_document(&mut source, &mut document, &path, &target)
+                .map(|()| {
+                    // Растеризатор пересел на сохранённые байты — они уже
+                    // содержат всё, что показывали накладки.
+                    overlays.clear();
+                }) {
                 Ok(()) => RenderEvent::Saved { path: target },
                 Err(e) => RenderEvent::Failed {
                     page: None,
@@ -854,7 +909,6 @@ impl History {
 fn apply_edit(
     path: &Path,
     source: &mut Option<LoDocument>,
-    rendered: &mut PdfDocument<'static>,
     request: &BlockEdit,
     history: &mut History,
 ) -> Result<Option<RewriteOutcome>> {
@@ -886,8 +940,6 @@ fn apply_edit(
         before,
         after: document.get_page_content(page_id),
     });
-
-    reload(document, rendered)?;
     Ok(outcome)
 }
 
@@ -913,7 +965,6 @@ fn run_page_op(
 fn apply_batch(
     path: &Path,
     source: &mut Option<LoDocument>,
-    rendered: &mut PdfDocument<'static>,
     edits: &[BlockEdit],
     history: &mut History,
 ) -> Result<()> {
@@ -943,7 +994,7 @@ fn apply_batch(
         before,
         after: document.get_page_content(page_id),
     });
-    reload(document, rendered)
+    Ok(())
 }
 
 /// Что изменил шаг истории — вызывающему решать, какое событие слать.
@@ -1034,9 +1085,13 @@ fn step_history(
         history.done.push(step);
     }
 
-    reload(document, rendered)?;
+    // Полная перечитка — только когда менялся состав страниц: правка
+    // содержимого обслуживается накладкой у вызывающего.
     let outcome = match outcome {
-        StepOutcome::Pages(_) => StepOutcome::Pages(describe(rendered)?),
+        StepOutcome::Pages(_) => {
+            reload(document, rendered)?;
+            StepOutcome::Pages(describe(rendered)?)
+        }
         content => content,
     };
     Ok(Some(outcome))
@@ -1055,6 +1110,11 @@ fn restyle_document(
     def: &crate::StyleDef,
     history: &mut History,
 ) -> Result<(u32, DocumentInfo)> {
+    // Каскад читает блоки из растеризатора, а тот после точечных правок
+    // отстаёт от структуры: правленые страницы жили в накладках. Один раз
+    // перечитываем документ целиком — для редкой и без того тяжёлой операции
+    // это честная цена.
+    reload(structure(path, source)?, rendered)?;
     let page_count = rendered.pages().len() as u32;
 
     // Сначала каталог: даже если блоков у стиля пока нет, правка спека
@@ -1089,7 +1149,7 @@ fn restyle_document(
             continue;
         }
 
-        let blocks = read_blocks(rendered, page)?;
+        let blocks = read_blocks((rendered, page))?;
         let blocks = split_by_marks(blocks, page, path, source, marked);
         let targets: Vec<&Block> = blocks
             .iter()
@@ -1203,6 +1263,44 @@ fn spans_from_block(block: &Block, def: &crate::StyleDef) -> Vec<crate::stream_e
         }
     }
     spans
+}
+
+/// Документ, из которого рисуется страница: накладка, если страница правлена.
+///
+/// Возвращается пара «документ, номер страницы в нём»: в накладке страница
+/// всегда одна и всегда первая.
+fn page_in<'a>(
+    document: &'a PdfDocument<'static>,
+    overlays: &'a HashMap<u32, PdfDocument<'static>>,
+    page: u32,
+) -> (&'a PdfDocument<'static>, u32) {
+    match overlays.get(&page) {
+        Some(single) => (single, 0),
+        None => (document, page),
+    }
+}
+
+/// Пересобирает накладку правленой страницы: одностраничная выжимка из
+/// структуры сериализуется и перечитывается растеризатором. Стоит долей
+/// секунды против секунд полной перечитки книги.
+fn refresh_overlay(
+    path: &Path,
+    source: &mut Option<LoDocument>,
+    overlays: &mut HashMap<u32, PdfDocument<'static>>,
+    page_number: u32,
+) -> Result<()> {
+    let document = structure(path, source)?;
+    let mut single = extract_page(document, page_number)
+        .with_context(|| format!("не удалось выделить страницу {page_number} для накладки"))?;
+    let mut bytes = Vec::new();
+    single
+        .save_to(&mut bytes)
+        .context("не удалось сериализовать накладку")?;
+    let rendered = pdfium()?
+        .load_pdf_from_byte_vec(bytes, None)
+        .context("не удалось перечитать накладку")?;
+    overlays.insert(page_number.saturating_sub(1), rendered);
+    Ok(())
 }
 
 /// Перечитывает документ растеризатором после изменения структуры.
@@ -1519,10 +1617,11 @@ fn describe(document: &PdfDocument<'static>) -> Result<DocumentInfo> {
     })
 }
 
-fn render_tile(document: &PdfDocument<'static>, key: TileKey) -> Result<Bitmap> {
+fn render_tile(source: (&PdfDocument<'static>, u32), key: TileKey) -> Result<Bitmap> {
+    let (document, index) = source;
     let page = document
         .pages()
-        .get(key.page as PdfPageIndex)
+        .get(index as PdfPageIndex)
         .with_context(|| format!("нет страницы {}", key.page))?;
 
     // Поворот здесь не задаётся намеренно: он хранится в самой странице
@@ -1549,7 +1648,8 @@ fn render_tile(document: &PdfDocument<'static>, key: TileKey) -> Result<Bitmap> 
     })
 }
 
-fn read_blocks(document: &PdfDocument<'static>, page_index: u32) -> Result<Vec<Block>> {
+fn read_blocks(source: (&PdfDocument<'static>, u32)) -> Result<Vec<Block>> {
+    let (document, page_index) = source;
     let page = document
         .pages()
         .get(page_index as PdfPageIndex)
