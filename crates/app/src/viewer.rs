@@ -341,6 +341,10 @@ const PAGE_CHROME_Y: f32 = 52.0;
 /// Зазор между страницами разворота.
 const SPREAD_GAP: f32 = 16.0;
 
+/// Потолок растра одной страницы в точках. Двенадцать мегапикселей — это
+/// 48 МБ на тайл: пять-шесть страниц ещё умещаются в бюджет кэша разом.
+const MAX_TILE_PIXELS: f32 = 12_000_000.0;
+
 const PREFETCH_AHEAD: u32 = 4;
 const PREFETCH_BEHIND: u32 = 1;
 /// Сколько миниатюр готовится за пределами видимой части панели.
@@ -428,9 +432,27 @@ impl Document {
     fn page_key(&self, page: u32, scale_factor: f32) -> TileKey {
         TileKey {
             page,
-            zoom: ZoomBucket::from_scale(self.zoom * scale_factor),
+            zoom: ZoomBucket::from_scale(self.raster_scale(page, scale_factor)),
             rotation: self.rotation,
         }
+    }
+
+    /// Масштаб растеризации страницы — тот же зум, но с потолком по числу
+    /// точек.
+    ///
+    /// Растр целой страницы растёт как квадрат зума: на 500 % разворот в
+    /// 5300×6900 точек весит полтораста мегабайт, в бюджет кэша влезает пара
+    /// таких, и соседи вытесняются на каждой прокрутке — счётчики внизу
+    /// пляшут, страницы моргают. Выше потолка картинка просто растягивается:
+    /// мягче, чем была бы, но зато без вечной перерисовки.
+    fn raster_scale(&self, page: u32, scale_factor: f32) -> f32 {
+        let want = self.zoom * scale_factor;
+        let Some(size) = self.info.size(page) else {
+            return want;
+        };
+        let area = (size.width * size.height).max(1.0);
+        let cap = (MAX_TILE_PIXELS / area).sqrt();
+        want.min(cap)
     }
 }
 
@@ -523,6 +545,12 @@ pub struct Viewer {
     /// Плотность пикселей окна, снятая на последней отрисовке. Нужна там, где
     /// растр запрашивается не из `render` и окна под рукой нет.
     scale_factor: f32,
+    /// Сдвиг страниц поперёк ленты: положительный — содержимое уехало влево,
+    /// то есть видно правый край. Нужен, когда страница шире окна: ленте
+    /// самой вбок ехать некуда.
+    pan_x: f32,
+    /// Протяжка колёсиком: с чего начали и каким был сдвиг на тот момент.
+    pan_drag: Option<PanDrag>,
     /// По какому размеру подбирается масштаб чтения.
     fit: Fit,
     /// Разворот: две страницы в ряд, как в раскрытой книге.
@@ -530,6 +558,13 @@ pub struct Viewer {
     /// Место, отведённое ленте в окне, снятое на прошлой отрисовке. По нему
     /// считается подгонка: размер окна известен только после раскладки.
     canvas_size: gpui::Size<Pixels>,
+}
+
+/// Протяжка страницы колёсиком: точка захвата и сдвиг на её момент.
+#[derive(Clone, Copy)]
+pub(crate) struct PanDrag {
+    at: Point<Pixels>,
+    pan: f32,
 }
 
 /// Как подбирается масштаб чтения.
@@ -579,6 +614,8 @@ impl Viewer {
             focus_editor: false,
             focus_root: false,
             scale_factor: 1.0,
+            pan_x: 0.0,
+            pan_drag: None,
             fit: Fit::default(),
             spread: false,
             canvas_size: gpui::size(px(0.0), px(0.0)),
@@ -2794,6 +2831,7 @@ impl Viewer {
             item_ix: row,
             offset_in_item: px(0.0),
         });
+        self.clamp_pan();
         cx.notify();
     }
 
@@ -2843,6 +2881,47 @@ impl Viewer {
         }
         self.apply_fit(cx);
         cx.notify();
+    }
+
+    /// Ширина того, что лежит в ряду ленты, при нынешнем масштабе.
+    fn content_width(&self) -> f32 {
+        let Some(doc) = self.doc.as_ref() else {
+            return 0.0;
+        };
+        let Some(size) = doc.info.size(doc.current_page).or_else(|| doc.info.size(0)) else {
+            return 0.0;
+        };
+        let page = size.width * doc.zoom;
+        if self.spread {
+            page * 2.0 + SPREAD_GAP
+        } else {
+            page
+        }
+    }
+
+    /// Насколько далеко можно увести страницу вбок. Ряд стоит по центру, и
+    /// вылезает он поровну с обеих сторон — отсюда половина.
+    fn max_pan(&self) -> f32 {
+        let room = f32::from(self.canvas_size.width) - PAGE_CHROME_X;
+        ((self.content_width() - room) / 2.0).max(0.0)
+    }
+
+    /// Сдвигает страницы вбок, не выпуская их края внутрь окна.
+    fn set_pan(&mut self, value: f32, cx: &mut Context<Self>) {
+        let limit = self.max_pan();
+        let value = value.clamp(-limit, limit);
+        if (value - self.pan_x).abs() < 0.01 {
+            return;
+        }
+        self.pan_x = value;
+        cx.notify();
+    }
+
+    /// Возвращает сдвиг в допустимые пределы: масштаб или размер окна
+    /// изменились, и вчерашний сдвиг мог оставить страницу за краем.
+    fn clamp_pan(&mut self) {
+        let limit = self.max_pan();
+        self.pan_x = self.pan_x.clamp(-limit, limit);
     }
 
     /// Влезает ли разворот в окно при нынешнем масштабе.
@@ -2900,6 +2979,7 @@ impl Viewer {
         }
         self.canvas_size = size;
         self.apply_fit(cx);
+        self.clamp_pan();
     }
 
     /// Слежение за мышью, которое не зависит от того, что лежит под курсором.
@@ -2942,6 +3022,107 @@ impl Viewer {
                         });
                     }
                     cx.stop_propagation();
+                });
+
+                // Два пальца поперёк трекпада (и наклон колеса вбок) двигают
+                // страницу, когда она шире окна. Событие приходит общим — и
+                // вбок, и вниз сразу, — поэтому ленте оно достаётся всегда,
+                // кроме случая, когда жест явно горизонтальный.
+                let pan_view = view.clone();
+                window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _, cx| {
+                    if phase != gpui::DispatchPhase::Capture
+                        || event.modifiers.control
+                        || !bounds.contains(&event.position)
+                    {
+                        return;
+                    }
+                    let delta = event.delta.pixel_delta(px(20.0));
+                    let dx = f32::from(delta.x);
+                    let dy = f32::from(delta.y);
+                    if dx.abs() < 0.01 {
+                        return;
+                    }
+                    let Some(view) = pan_view.upgrade() else {
+                        return;
+                    };
+                    let moved = view.update(cx, |this, cx| {
+                        if this.max_pan() <= 0.0 {
+                            return false;
+                        }
+                        this.set_pan(this.pan_x - dx, cx);
+                        true
+                    });
+                    // Прокрутку вниз отдаём ленте: у трекпада в одном событии
+                    // приезжают обе оси, и глотать его целиком значило бы
+                    // остановить чтение вместе со сдвигом.
+                    if moved && dx.abs() > dy.abs() {
+                        cx.stop_propagation();
+                    }
+                });
+
+                // Нажатое колёсико таскает страницу — привычный жест из всех
+                // просмотрщиков: вбок сдвигом ряда, вверх-вниз прокруткой.
+                let grab_view = view.clone();
+                window.on_mouse_event(move |event: &gpui::MouseDownEvent, phase, _, cx| {
+                    if phase != gpui::DispatchPhase::Capture
+                        || event.button != MouseButton::Middle
+                        || !bounds.contains(&event.position)
+                    {
+                        return;
+                    }
+                    if let Some(view) = grab_view.upgrade() {
+                        view.update(cx, |this, _| {
+                            this.pan_drag = Some(PanDrag {
+                                at: event.position,
+                                pan: this.pan_x,
+                            });
+                        });
+                    }
+                    cx.stop_propagation();
+                });
+
+                let drag_view = view.clone();
+                window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                    if phase != gpui::DispatchPhase::Capture {
+                        return;
+                    }
+                    let position = event.position;
+                    if let Some(view) = drag_view.upgrade() {
+                        view.update(cx, |this, cx| {
+                            let Some(drag) = this.pan_drag else { return };
+                            if event.pressed_button != Some(MouseButton::Middle) {
+                                this.pan_drag = None;
+                                return;
+                            }
+                            let dx = f32::from(position.x - drag.at.x);
+                            let dy = position.y - drag.at.y;
+                            this.set_pan(drag.pan - dx, cx);
+                            // Лента живёт своей прокруткой, поэтому по вертикали
+                            // страница едет ею же: тащим вниз — лента вверх.
+                            if let Some(doc) = this.doc.as_ref() {
+                                doc.pages.scroll_by(-dy);
+                            }
+                            // Точка захвата переносится: прокрутка ленты
+                            // отсчитывается от прошлого кадра, а не от начала
+                            // жеста, и складывать её со сдвигом нельзя.
+                            this.pan_drag = Some(PanDrag {
+                                at: position,
+                                pan: this.pan_x,
+                            });
+                            cx.notify();
+                        });
+                    }
+                });
+
+                let release_view = view.clone();
+                window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, _, cx| {
+                    if phase != gpui::DispatchPhase::Capture || event.button != MouseButton::Middle
+                    {
+                        return;
+                    }
+                    if let Some(view) = release_view.upgrade() {
+                        view.update(cx, |this, _| this.pan_drag = None);
+                    }
                 });
 
                 let menu_view = view.clone();
@@ -3033,6 +3214,12 @@ impl Viewer {
             },
         )
         .absolute()
+        // Угол прибит явно: без `top`/`left` «absolute» встаёт на своё место в
+        // потоке — то есть ПОД лентой, за нижним краем окна. Область
+        // обработчиков оказывалась вне экрана, и проверка «курсор внутри»
+        // никогда не срабатывала: щипок и Ctrl+колесо не делали ничего.
+        .top_0()
+        .left_0()
         .size_full()
         .into_any_element()
     }
@@ -5560,11 +5747,22 @@ impl Viewer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Сдвиг вбок делается перекосом полей ряда: содержимое стоит по
+        // центру, и поле с одной стороны уводит его в другую ровно на
+        // половину. Смещением (`left`) не выйдет: ряды — элементы ленты, она
+        // кладёт их по своим координатам и вложенный отступ теряется.
+        let (pad_left, pad_right) = if self.pan_x >= 0.0 {
+            (px(0.0), px(self.pan_x * 2.0))
+        } else {
+            (px(-self.pan_x * 2.0), px(0.0))
+        };
         if !self.spread {
             return v_flex()
                 .w_full()
                 .items_center()
                 .py_3()
+                .pl(pad_left)
+                .pr(pad_right)
                 .child(self.render_page(ix as u32, scale_factor, window, cx))
                 .into_any_element();
         }
@@ -5580,6 +5778,8 @@ impl Viewer {
             .items_start()
             .justify_center()
             .py_3()
+            .pl(pad_left)
+            .pr(pad_right)
             .gap(px(SPREAD_GAP));
         for page in [left, left + 1] {
             if page < count {
@@ -5788,8 +5988,10 @@ impl Viewer {
         let text = match self.doc.as_ref() {
             // Сообщение о сохранении или отказе в правке важнее счётчиков.
             Some(doc) => doc.status.clone().unwrap_or_else(|| {
+                // Ширина полей закреплена: счётчики меняются каждый кадр, и
+                // на «плавающей» ширине вся строка дёргается туда-сюда.
                 format!(
-                    "стр. {} из {}   ·   кэш {:.0} МБ в {} тайлах   ·   в очереди {}",
+                    "стр. {:>4} из {:<4}   ·   кэш {:>4.0} МБ в {:>3} тайлах   ·   в очереди {:>3}",
                     doc.current_page + 1,
                     doc.info.page_count,
                     doc.tiles.bytes() as f64 / (1024.0 * 1024.0),
