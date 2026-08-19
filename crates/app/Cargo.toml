@@ -1,0 +1,29 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "PDFer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+dirs = "6.0.0"
+flume = "0.12.0"
+gpui = "0.2.2"
+gpui-component = "0.5.1"
+image = "0.25.10"
+pdfcore = { version = "0.1.0", path = "../pdfcore" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+
+[target.'cfg(windows)'.build-dependencies]
+ico = "0.4.0"
+resvg = "0.45.1"
+tiny-skia = "0.11.4"
+usvg = "0.45.1"
+winresource = "0.1.24"

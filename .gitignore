@@ -1,0 +1,6 @@
+/target
+/vendor/pdfium
+/dist
+*.pdb
+*.pdf
+.DS_Store

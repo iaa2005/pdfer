@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/pdfcore", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+
+# Профиль отладки: сам наш код без оптимизаций (быстрая пересборка),
+# но зависимости — с opt-level 2, иначе рендер и шейпинг текста
+# в debug-сборке неюзабельно медленные.
+[profile.dev]
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
