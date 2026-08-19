@@ -333,6 +333,14 @@ const ZOOM_STEP: f32 = 1.25;
 
 /// Сколько страниц растеризуется наперёд по ходу прокрутки и сколько — назад.
 /// Вперёд больше: читают почти всегда вниз.
+/// Поля вокруг страницы в ленте: отступы карточки, рамка и строка с номером.
+/// Вычитаются при подгонке, иначе подогнанная страница на пиксель да не
+/// влезает и лента получает лишнюю полосу прокрутки.
+const PAGE_CHROME_X: f32 = 24.0;
+const PAGE_CHROME_Y: f32 = 52.0;
+/// Зазор между страницами разворота.
+const SPREAD_GAP: f32 = 16.0;
+
 const PREFETCH_AHEAD: u32 = 4;
 const PREFETCH_BEHIND: u32 = 1;
 /// Сколько миниатюр готовится за пределами видимой части панели.
@@ -515,6 +523,25 @@ pub struct Viewer {
     /// Плотность пикселей окна, снятая на последней отрисовке. Нужна там, где
     /// растр запрашивается не из `render` и окна под рукой нет.
     scale_factor: f32,
+    /// По какому размеру подбирается масштаб чтения.
+    fit: Fit,
+    /// Разворот: две страницы в ряд, как в раскрытой книге.
+    spread: bool,
+    /// Место, отведённое ленте в окне, снятое на прошлой отрисовке. По нему
+    /// считается подгонка: размер окна известен только после раскладки.
+    canvas_size: gpui::Size<Pixels>,
+}
+
+/// Как подбирается масштаб чтения.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum Fit {
+    /// Масштаб задан руками — колесом, кнопками, «100 %».
+    #[default]
+    Free,
+    /// Страница по ширине окна.
+    Width,
+    /// Страница целиком по высоте окна.
+    Height,
 }
 
 impl Viewer {
@@ -552,6 +579,9 @@ impl Viewer {
             focus_editor: false,
             focus_root: false,
             scale_factor: 1.0,
+            fit: Fit::default(),
+            spread: false,
+            canvas_size: gpui::size(px(0.0), px(0.0)),
         };
         viewer.open(path, cx);
         viewer
@@ -734,7 +764,16 @@ impl Viewer {
                     let pages_at = doc.pages.logical_scroll_top().item_ix;
                     let thumbs_at = doc.thumbs.logical_scroll_top().item_ix;
                     doc.info = info;
-                    doc.pages.reset(count);
+                    // Лента считает рядами: в развороте их вдвое меньше, чем
+                    // страниц, и сбрасывать её по числу страниц значило бы
+                    // показать половину документа пустыми рядами.
+                    let rows = if self.spread {
+                        count.div_ceil(2)
+                    } else {
+                        count
+                    };
+                    let doc = self.doc.as_mut().expect("документ открыт");
+                    doc.pages.reset(rows);
                     doc.thumbs.reset(count);
                     if count > 0 {
                         // Именно `scroll_to`, а не «показать элемент»: после
@@ -742,15 +781,17 @@ impl Viewer {
                         // прокрутить» на нулях всегда выдаёт начало ленты.
                         // Смещение внутри страницы по той же причине не
                         // восстанавливается — только её номер.
-                        let at = |item_ix: usize| gpui::ListOffset {
-                            item_ix: item_ix.min(count - 1),
+                        let at = |item_ix: usize, last: usize| gpui::ListOffset {
+                            item_ix: item_ix.min(last),
                             offset_in_item: px(0.0),
                         };
-                        doc.pages.scroll_to(at(pages_at));
-                        doc.thumbs.scroll_to(at(thumbs_at));
+                        let row = at(pages_at, rows - 1);
+                        doc.pages.scroll_to(row);
+                        doc.thumbs.scroll_to(at(thumbs_at, count - 1));
                         // Иначе следующий же кадр решит, что читаемая
                         // страница сменилась, и потащит миниатюры за собой.
-                        doc.current_page = at(pages_at).item_ix as u32;
+                        doc.current_page = (row.item_ix as u32 * if rows == count { 1 } else { 2 })
+                            .min(count as u32 - 1);
                     }
                     doc.blocks.clear();
                     doc.blocks_requested.clear();
@@ -792,6 +833,7 @@ impl Viewer {
 
     /// Пересчитывает список нужных тайлов по текущему положению вьюпорта.
     fn sync_requests(&mut self, scale_factor: f32) {
+        let spread = self.spread;
         let Some(doc) = self.doc.as_mut() else { return };
         let count = doc.info.page_count;
         if count == 0 {
@@ -845,7 +887,9 @@ impl Viewer {
             return;
         }
 
-        let first = (doc.pages.logical_scroll_top().item_ix as u32).min(count - 1);
+        // Верхний ряд ленты — это страница, а в развороте пара страниц.
+        let row = doc.pages.logical_scroll_top().item_ix as u32;
+        let first = (if spread { row * 2 } else { row }).min(count - 1);
         // Панель миниатюр следует за лентой: иначе на длинном документе она
         // остаётся там, где её оставили, и перестаёт показывать, где ты сейчас.
         if doc.current_page != first {
@@ -855,7 +899,13 @@ impl Viewer {
 
         let mut wanted = Vec::new();
         let start = first.saturating_sub(PREFETCH_BEHIND);
-        for page in start..(first + PREFETCH_AHEAD + 1).min(count) {
+        // В развороте на экране вдвое больше страниц — и запас нужен вдвое.
+        let ahead = if spread {
+            PREFETCH_AHEAD * 2 + 1
+        } else {
+            PREFETCH_AHEAD
+        };
+        for page in start..(first + ahead + 1).min(count) {
             let key = doc.page_key(page, scale_factor);
             if !doc.tiles.contains(&key) {
                 wanted.push(key);
@@ -2702,6 +2752,20 @@ impl Viewer {
         cx.notify();
     }
 
+    /// Сколько рядов в ленте: в развороте на ряд приходится две страницы.
+    fn row_count(&self, pages: u32) -> usize {
+        if self.spread {
+            pages.div_ceil(2) as usize
+        } else {
+            pages as usize
+        }
+    }
+
+    /// Ряд, в котором лежит страница.
+    fn row_of(&self, page: u32) -> usize {
+        if self.spread { page / 2 } else { page }.max(0) as usize
+    }
+
     fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
         let Some(doc) = self.doc.as_mut() else { return };
         let zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
@@ -2720,18 +2784,122 @@ impl Viewer {
         // стал виден» на нулевых высотах всегда выдаёт самое начало ленты.
         // Здесь же нужное положение известно точно — искомая страница просто
         // становится верхней.
-        let page = doc.current_page as usize;
-        doc.pages.reset(doc.info.page_count as usize);
+        let page = doc.current_page;
+        let count = doc.info.page_count;
+        let rows = self.row_count(count);
+        let row = self.row_of(page).min(rows.saturating_sub(1));
+        let doc = self.doc.as_mut().expect("документ проверен выше");
+        doc.pages.reset(rows);
         doc.pages.scroll_to(gpui::ListOffset {
-            item_ix: page,
+            item_ix: row,
             offset_in_item: px(0.0),
         });
         cx.notify();
     }
 
-    fn zoom_by(&mut self, factor: f32, cx: &mut Context<Self>) {
+    /// Масштаб, заданный руками, отменяет подгонку: иначе следующая же смена
+    /// размера окна молча вернула бы прежний и человек решил бы, что колесо
+    /// сломалось.
+    fn zoom_manually(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        self.fit = Fit::Free;
+        self.set_zoom(zoom, cx);
+    }
+
+    fn zoom_manually_by(&mut self, factor: f32, cx: &mut Context<Self>) {
         let current = self.doc.as_ref().map(|d| d.zoom).unwrap_or(1.0);
-        self.set_zoom(current * factor, cx);
+        self.zoom_manually(current * factor, cx);
+    }
+
+    /// Выбор способа подгонки: по ширине, по высоте или обратно к ручному.
+    pub(crate) fn set_fit(&mut self, fit: Fit, cx: &mut Context<Self>) {
+        self.fit = if self.fit == fit { Fit::Free } else { fit };
+        self.apply_fit(cx);
+        cx.notify();
+    }
+
+    /// Разворот: две страницы в ряд. Масштаб пересчитывается сразу — в
+    /// развороте странице достаётся половина ширины.
+    pub(crate) fn toggle_spread(&mut self, cx: &mut Context<Self>) {
+        self.spread = !self.spread;
+        // Лента считает рядами, и их число только что изменилось.
+        if let Some(doc) = self.doc.as_ref() {
+            let count = doc.info.page_count;
+            let page = doc.current_page;
+            let rows = self.row_count(count);
+            let row = self.row_of(page).min(rows.saturating_sub(1));
+            let doc = self.doc.as_mut().expect("документ проверен выше");
+            doc.pages.reset(rows);
+            doc.pages.scroll_to(gpui::ListOffset {
+                item_ix: row,
+                offset_in_item: px(0.0),
+            });
+        }
+        // Развороту нужна вся ширина окна. Если при нынешнем масштабе пара
+        // страниц в него не влезает, разъезжаться ей некуда: лента не
+        // прокручивается вбок, и края страниц просто обрезало бы. Тогда
+        // масштаб подбирается сам — по ширине.
+        if self.spread && self.fit == Fit::Free && !self.spread_fits() {
+            self.fit = Fit::Width;
+        }
+        self.apply_fit(cx);
+        cx.notify();
+    }
+
+    /// Влезает ли разворот в окно при нынешнем масштабе.
+    fn spread_fits(&self) -> bool {
+        let width = f32::from(self.canvas_size.width);
+        let Some(doc) = self.doc.as_ref() else {
+            return true;
+        };
+        let Some(size) = doc.info.size(doc.current_page).or_else(|| doc.info.size(0)) else {
+            return true;
+        };
+        size.width * doc.zoom * 2.0 + PAGE_CHROME_X + SPREAD_GAP <= width
+    }
+
+    /// Пересчитывает масштаб под текущий способ подгонки и размер окна.
+    fn apply_fit(&mut self, cx: &mut Context<Self>) {
+        if self.fit == Fit::Free {
+            return;
+        }
+        let width = f32::from(self.canvas_size.width);
+        let height = f32::from(self.canvas_size.height);
+        if width <= 1.0 || height <= 1.0 {
+            return;
+        }
+        let Some(doc) = self.doc.as_ref() else { return };
+        // Меряется по читаемой странице: у книги бывают вклейки другого
+        // формата, и подгонять их по первой странице было бы враньём.
+        let Some(size) = doc.info.size(doc.current_page).or_else(|| doc.info.size(0)) else {
+            return;
+        };
+        if size.width <= 0.0 || size.height <= 0.0 {
+            return;
+        }
+
+        let zoom = match self.fit {
+            Fit::Width => {
+                let room = if self.spread {
+                    (width - PAGE_CHROME_X - SPREAD_GAP) / 2.0
+                } else {
+                    width - PAGE_CHROME_X
+                };
+                room / size.width
+            }
+            Fit::Height => (height - PAGE_CHROME_Y) / size.height,
+            Fit::Free => return,
+        };
+        self.set_zoom(zoom, cx);
+    }
+
+    /// Место, которое лента занимает в окне. Пишется отрисовкой: до раскладки
+    /// размер неизвестен, а подгонка считается именно от него.
+    fn note_canvas(&mut self, size: gpui::Size<Pixels>, cx: &mut Context<Self>) {
+        if self.canvas_size == size {
+            return;
+        }
+        self.canvas_size = size;
+        self.apply_fit(cx);
     }
 
     /// Слежение за мышью, которое не зависит от того, что лежит под курсором.
@@ -2769,7 +2937,9 @@ impl Viewer {
                     if step.abs() > 0.01
                         && let Some(view) = zoom_view.upgrade()
                     {
-                        view.update(cx, |this, cx| this.zoom_by((step / 150.0).exp(), cx));
+                        view.update(cx, |this, cx| {
+                            this.zoom_manually_by((step / 150.0).exp(), cx)
+                        });
                     }
                     cx.stop_propagation();
                 });
@@ -2881,12 +3051,13 @@ impl Viewer {
     }
 
     fn go_to_page(&mut self, page: u32, cx: &mut Context<Self>) {
+        let row = self.row_of(page);
         if let Some(doc) = self.doc.as_mut() {
             // Именно `scroll_to`, а не «показать элемент»: высоты далёких
             // страниц ещё не измерены, и «показать» честно считал смещение по
             // нулям — клик по дальней миниатюре уводил ленту к началу.
             doc.pages.scroll_to(gpui::ListOffset {
-                item_ix: page as usize,
+                item_ix: row,
                 offset_in_item: px(0.0),
             });
             doc.current_page = page;
@@ -2939,9 +3110,9 @@ impl Viewer {
             return;
         }
         match event.keystroke.key.as_str() {
-            "=" | "+" if modifiers.control => self.zoom_by(ZOOM_STEP, cx),
-            "-" if modifiers.control => self.zoom_by(1.0 / ZOOM_STEP, cx),
-            "0" if modifiers.control => self.set_zoom(1.0, cx),
+            "=" | "+" if modifiers.control => self.zoom_manually_by(ZOOM_STEP, cx),
+            "-" if modifiers.control => self.zoom_manually_by(1.0 / ZOOM_STEP, cx),
+            "0" if modifiers.control => self.zoom_manually(1.0, cx),
             "s" if modifiers.control => self.save(cx),
             "z" if modifiers.control => self.undo(cx),
             "y" if modifiers.control => self.redo(cx),
@@ -2957,6 +3128,8 @@ impl Viewer {
 
     fn render_toolbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let zoom = self.doc.as_ref().map(|d| d.zoom).unwrap_or(1.0);
+        let fit = self.fit;
+        let spread = self.spread;
         let show_blocks = self.doc.as_ref().is_some_and(|d| d.show_blocks);
         let snapping = self.snapping;
         let show_properties = self.show_properties;
@@ -3028,25 +3201,54 @@ impl Viewer {
                     .on_click(cx.listener(|this, _, _, cx| this.redo(cx))),
             )
             .child(
-                Button::new("zoom-out")
-                    .small()
-                    .ghost()
-                    .label("−")
-                    .on_click(cx.listener(|this, _, _, cx| this.zoom_by(1.0 / ZOOM_STEP, cx))),
+                Button::new("zoom-out").small().ghost().label("−").on_click(
+                    cx.listener(|this, _, _, cx| this.zoom_manually_by(1.0 / ZOOM_STEP, cx)),
+                ),
             )
             .child(
                 Button::new("zoom-reset")
                     .small()
                     .ghost()
                     .label(format!("{:.0}%", zoom * 100.0))
-                    .on_click(cx.listener(|this, _, _, cx| this.set_zoom(1.0, cx))),
+                    .tooltip("Вернуть натуральную величину (Ctrl+0)")
+                    .on_click(cx.listener(|this, _, _, cx| this.zoom_manually(1.0, cx))),
             )
             .child(
                 Button::new("zoom-in")
                     .small()
                     .ghost()
                     .label("+")
-                    .on_click(cx.listener(|this, _, _, cx| this.zoom_by(ZOOM_STEP, cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.zoom_manually_by(ZOOM_STEP, cx))),
+            )
+            // Как показывать документ: во всю ширину, целиком по высоте и
+            // разворотом в две страницы. Первые две — взаимоисключающие
+            // способы подгонки, разворот работает с любым из них.
+            .child(
+                Button::new("fit-width")
+                    .small()
+                    .when(fit == Fit::Width, |b| b.primary())
+                    .when(fit != Fit::Width, |b| b.ghost())
+                    .icon(gpui_component::Icon::empty().path("icons/fit-width.svg"))
+                    .tooltip("На всю ширину: страница по ширине окна")
+                    .on_click(cx.listener(|this, _, _, cx| this.set_fit(Fit::Width, cx))),
+            )
+            .child(
+                Button::new("fit-height")
+                    .small()
+                    .when(fit == Fit::Height, |b| b.primary())
+                    .when(fit != Fit::Height, |b| b.ghost())
+                    .icon(gpui_component::Icon::empty().path("icons/fit-height.svg"))
+                    .tooltip("На всю высоту: страница целиком в окне")
+                    .on_click(cx.listener(|this, _, _, cx| this.set_fit(Fit::Height, cx))),
+            )
+            .child(
+                Button::new("spread")
+                    .small()
+                    .when(spread, |b| b.primary())
+                    .when(!spread, |b| b.ghost())
+                    .icon(gpui_component::Icon::empty().path("icons/page-spread.svg"))
+                    .tooltip("В две страницы: разворот, как в раскрытой книге")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_spread(cx))),
             )
             .child(
                 Button::new("toggle-properties")
@@ -5259,6 +5461,22 @@ impl Viewer {
         let this = cx.entity().downgrade();
 
         let hooks = self.render_mouse_hooks(cx);
+        // Замер места под ленту: по нему считается подгонка страницы под окно.
+        let measure = {
+            let view = cx.entity().downgrade();
+            gpui::canvas(
+                |bounds, _, _| bounds,
+                move |bounds, _, _, cx| {
+                    if let Some(view) = view.upgrade() {
+                        view.update(cx, |this, cx| this.note_canvas(bounds.size, cx));
+                    }
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+        };
         let tool = self.tool;
         let toolbar = div()
             .absolute()
@@ -5318,20 +5536,62 @@ impl Viewer {
                 // угол страницы приходил то настоящий, то из этой примерки.
                 list(state, move |ix, window, cx| {
                     this.update(cx, |viewer, cx| {
-                        viewer.render_page(ix, scale_factor, window, cx)
+                        viewer.render_row(ix, scale_factor, window, cx)
                     })
                     .unwrap_or_else(|_| div().into_any_element())
                 })
                 .size_full(),
             )
+            .child(measure)
             .child(hooks)
             .child(toolbar)
             .into_any_element()
     }
 
-    fn render_page(
+    /// Ряд ленты: одна страница, а в развороте — пара, как в раскрытой книге.
+    ///
+    /// Разворот собирается именно рядом, а не двумя элементами списка: лента
+    /// меряет высоту поэлементно и укладывает элементы строго друг под друга,
+    /// так что поставить две страницы бок о бок можно только внутри одного.
+    fn render_row(
         &mut self,
         ix: usize,
+        scale_factor: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if !self.spread {
+            return v_flex()
+                .w_full()
+                .items_center()
+                .py_3()
+                .child(self.render_page(ix as u32, scale_factor, window, cx))
+                .into_any_element();
+        }
+
+        let count = self
+            .doc
+            .as_ref()
+            .map(|doc| doc.info.page_count)
+            .unwrap_or(0);
+        let left = ix as u32 * 2;
+        let mut row = h_flex()
+            .w_full()
+            .items_start()
+            .justify_center()
+            .py_3()
+            .gap(px(SPREAD_GAP));
+        for page in [left, left + 1] {
+            if page < count {
+                row = row.child(self.render_page(page, scale_factor, window, cx));
+            }
+        }
+        row.into_any_element()
+    }
+
+    fn render_page(
+        &mut self,
+        page: u32,
         scale_factor: f32,
         _window: &mut Window,
         cx: &mut Context<Self>,
@@ -5341,7 +5601,6 @@ impl Viewer {
         let Some(doc) = self.doc.as_mut() else {
             return div().into_any_element();
         };
-        let page = ix as u32;
         let Some(size) = doc.info.size(page) else {
             return div().into_any_element();
         };
@@ -5468,9 +5727,7 @@ impl Viewer {
         let editing = self.render_editing(page, size.width, size.height, zoom, cx);
 
         v_flex()
-            .w_full()
             .items_center()
-            .py_3()
             .gap_1()
             .child(
                 div()
