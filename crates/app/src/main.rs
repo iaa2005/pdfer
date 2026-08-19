@@ -2,6 +2,11 @@
 //!
 //!     cargo run -p app -- book.pdf
 
+// Готовое приложение запускается без чёрного окна консоли: на Windows это
+// решает подсистема, выбранная при сборке. В отладочной сборке консоль
+// остаётся — там она и есть окно журнала.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod assets;
 mod editing;
 mod frame;
@@ -22,11 +27,64 @@ use gpui_component::Root;
 
 use workspace::Workspace;
 
-fn main() {
-    tracing_subscriber::fmt()
+/// Куда писать журнал.
+///
+/// В отладочной сборке — в консоль, как и раньше. В готовой консоли нет, и
+/// строки уходили бы в никуда: там журнал ложится файлом рядом с настройками,
+/// заново на каждый запуск, чтобы не рос без конца.
+fn init_tracing() {
+    let builder = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
-        .with_target(false)
-        .init();
+        .with_target(false);
+
+    if cfg!(debug_assertions) {
+        builder.init();
+        return;
+    }
+
+    let file = recents::data_dir().and_then(|dir| {
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join("pdfer.log");
+        std::fs::File::create(&path).ok().map(|file| (path, file))
+    });
+
+    match file {
+        Some((path, file)) => {
+            let file = std::sync::Arc::new(std::sync::Mutex::new(file));
+            builder
+                .with_ansi(false)
+                .with_writer(move || FileWriter(file.clone()))
+                .init();
+            tracing::info!(path = %path.display(), "журнал");
+        }
+        // Каталога данных нет или он закрыт на запись — тогда без журнала:
+        // ронять запуск редактора из-за него было бы совсем нелепо.
+        None => builder.with_writer(std::io::sink).init(),
+    }
+}
+
+/// Обёртка над файлом журнала: `tracing` просит писателя на каждую запись, а
+/// файл один на всё приложение и делится замком.
+struct FileWriter(std::sync::Arc<std::sync::Mutex<std::fs::File>>);
+
+impl std::io::Write for FileWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.0.lock() {
+            Ok(mut file) => file.write(buf),
+            Err(_) => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.0.lock() {
+            Ok(mut file) => file.flush(),
+            Err(_) => Ok(()),
+        }
+    }
+}
+
+fn main() {
+    init_tracing();
 
     let path = std::env::args().nth(1).map(std::path::PathBuf::from);
 

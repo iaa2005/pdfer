@@ -41,7 +41,10 @@ fn main() {
             resource.set("FileDescription", "PDFer — редактор PDF");
             resource.set("OriginalFilename", "PDFer.exe");
             resource.set("CompanyName", "IAA Labs");
-            resource.set("LegalCopyright", "MIT © IAA Labs · pdfium © The Chromium Authors");
+            resource.set(
+                "LegalCopyright",
+                "MIT © IAA Labs · pdfium © The Chromium Authors",
+            );
             if let Err(e) = resource.compile() {
                 println!("cargo:warning=иконка не вшита: {e}");
             }
