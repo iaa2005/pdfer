@@ -1,4 +1,5 @@
-//! Встроенные ресурсы приложения: иконки Hugeicons и шрифт Geist Mono.
+//! Встроенные ресурсы приложения: иконки Hugeicons, логотип и шрифт Geist
+//! Mono.
 //!
 //! Набор скачан пользователем и лежит в репозитории проекта; сюда попадают
 //! только реально используемые файлы, вкомпилированные в исполняемый файл, —
@@ -16,6 +17,16 @@ macro_rules! icons {
         &[$(($name, include_bytes!(concat!("../assets/", $name)) as &[u8])),+]
     };
 }
+
+/// Логотип для стартовой страницы. Именно растр, а не SVG: gpui рисует
+/// векторные ресурсы одноцветной маской, и знак — розовый квадрат с белой
+/// буквой и светлым словом рядом — слипся бы в сплошной силуэт. Растр
+/// готовится при сборке из `logo.svg` (см. `build.rs`), поэтому править
+/// по-прежнему нужно только исходный вектор.
+const IMAGES: &[(&str, &[u8])] = &[(
+    "images/logo.png",
+    include_bytes!(concat!(env!("OUT_DIR"), "/logo.png")),
+)];
 
 const ASSETS: &[(&str, &[u8])] = icons![
     "icons/add-01.svg",
@@ -72,6 +83,7 @@ impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         Ok(ASSETS
             .iter()
+            .chain(IMAGES)
             .find(|(name, _)| *name == path)
             .map(|(_, bytes)| Cow::Borrowed(*bytes)))
     }
@@ -79,6 +91,7 @@ impl AssetSource for Assets {
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         Ok(ASSETS
             .iter()
+            .chain(IMAGES)
             .filter(|(name, _)| name.starts_with(path))
             .map(|(name, _)| SharedString::from(*name))
             .collect())

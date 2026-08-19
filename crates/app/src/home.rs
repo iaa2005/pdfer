@@ -16,6 +16,11 @@ use gpui_component::button::{Button, ButtonVariants};
 use crate::recents::{RecentDoc, thumbnail_path};
 use crate::workspace::Workspace;
 
+/// Логотип на стартовой странице. Пропорции взяты из `logo.svg` (106 × 26):
+/// врать ими нельзя — знак растянется.
+const LOGO_HEIGHT: f32 = 26.0;
+const LOGO_WIDTH: f32 = LOGO_HEIGHT * 106.0 / 26.0;
+
 const CARD_WIDTH: f32 = 164.0;
 const THUMB_WIDTH: f32 = 148.0;
 const THUMB_HEIGHT: f32 = 196.0;
@@ -68,7 +73,9 @@ impl Workspace {
             .px_8()
             .pt_8()
             .pb_2()
-            .child(div().text_2xl().child("PDFer"))
+            // Знак вместо набранного названия: рисуется растром, готовым при
+            // сборке из `logo.svg`.
+            .child(img("images/logo.png").h(px(LOGO_HEIGHT)).w(px(LOGO_WIDTH)))
             .child(
                 Button::new("open-document")
                     .primary()
