@@ -32,7 +32,7 @@ pub mod styles;
 
 pub use blocks::{BlockOptions, detect_blocks};
 pub use cache::{Bitmap, DEFAULT_TILE_BUDGET, TileCache, TileKey, ZoomBucket};
-pub use fonts::{DocumentFont, FontRequest, system_fonts};
+pub use fonts::{DocumentFont, FaceInfo, FontRequest, system_fonts};
 pub use geom::{PageSize, Rect, Rotation};
 pub use model::{Align, Block, Line, Rgba, Style, StyleTemplate, TextRun};
 pub use pages::PageOp;

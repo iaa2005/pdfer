@@ -233,6 +233,8 @@ impl RichText {
                         run.style.document_script
                     },
                     underline: run.style.underline,
+                    bold: run.style.bold,
+                    italic: run.style.italic,
                 }
             })
             .collect()

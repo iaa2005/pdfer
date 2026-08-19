@@ -22,6 +22,15 @@ pub struct FaceInfo {
     pub family: String,
     pub bold: bool,
     pub italic: bool,
+    /// Имя начертания, как его дал сам шрифт: «Regular», «Semibold Italic».
+    pub style: String,
+    /// Вес из OS/2: 400 — обычный, 700 — полужирный. У вариативного файла —
+    /// вес развесовки по умолчанию.
+    pub weight: u16,
+    /// Вариативный шрифт: один файл на всю развесовку. pdfium встраивает его
+    /// экземпляром по умолчанию, поэтому при равном весе статический файл
+    /// предпочтительнее.
+    pub variable: bool,
     pub path: PathBuf,
 }
 
@@ -31,6 +40,9 @@ pub struct FontRequest {
     pub family: String,
     pub bold: bool,
     pub italic: bool,
+    /// Точное имя начертания — когда его выбрали в списке руками: «Light»,
+    /// «Black Italic». Пустое — подбор по флагам выше.
+    pub face: Option<String>,
 }
 
 impl FontRequest {
@@ -39,7 +51,14 @@ impl FontRequest {
             family: family.into(),
             bold,
             italic,
+            face: None,
         }
+    }
+
+    /// Тот же запрос, но с точным начертанием.
+    pub fn with_face(mut self, face: impl Into<String>) -> FontRequest {
+        self.face = Some(face.into());
+        self
     }
 }
 
@@ -181,13 +200,53 @@ impl SystemFonts {
         if same_family.is_empty() {
             return None;
         }
-        same_family
+
+        // Точное имя начертания — воля пользователя, она главнее флагов.
+        if let Some(face_name) = request.face.as_deref()
+            && let Some(exact) = same_family
+                .iter()
+                .find(|f| f.style.eq_ignore_ascii_case(face_name))
+        {
+            return Some(exact);
+        }
+
+        // Кандидаты ранжируются, а не отсекаются по очереди. Наклон дороже
+        // веса: полужирный запрос без полужирного начертания пусть выйдет
+        // обычным, но прямым — прямой текст, севший курсивом, выглядит
+        // ошибкой, а не заменой. Дальше вес, поближе к запрошенному, и в
+        // самом конце — статический файл перед вариативным: pdfium возьмёт
+        // из вариативного экземпляр по умолчанию, какой бы вес ни просили.
+        let wanted_weight: i32 = if request.bold { 700 } else { 400 };
+        same_family.into_iter().min_by_key(|f| {
+            (
+                f.italic != request.italic,
+                f.bold != request.bold,
+                (f.weight as i32 - wanted_weight).abs(),
+                f.variable,
+            )
+        })
+    }
+
+    /// Начертания одного семейства, от лёгких к тяжёлым, прямые прежде
+    /// курсивных. Ровно в таком порядке их показывает список выбора шрифта.
+    pub fn faces_of(&self, family: &str) -> Vec<FaceInfo> {
+        let wanted = family_key(family);
+        let mut faces: Vec<FaceInfo> = self
+            .faces
             .iter()
-            .find(|f| f.bold == request.bold && f.italic == request.italic)
-            .or_else(|| same_family.iter().find(|f| f.bold == request.bold))
-            .or_else(|| same_family.iter().find(|f| !f.bold && !f.italic))
-            .or(same_family.first())
-            .copied()
+            .filter(|face| family_key(&face.family) == wanted)
+            .cloned()
+            .collect();
+        faces.sort_by(|a, b| {
+            a.italic
+                .cmp(&b.italic)
+                .then(a.weight.cmp(&b.weight))
+                .then(a.style.cmp(&b.style))
+        });
+        // Один и тот же файл может лежать и в системной папке, и в
+        // пользовательской — начертание от этого не удваивается.
+        faces.dedup_by(|a, b| a.style == b.style);
+        faces
     }
 
     /// Есть ли такое семейство в системе.
@@ -389,11 +448,21 @@ fn read_face(path: &Path) -> Option<FaceInfo> {
     // «Arial Narrow Bold», то есть ровно то, что показывают в списке шрифтов.
     // Идентификатор 1 — запасной вариант.
     let family = face_name(&face, 16).or_else(|| face_name(&face, 1))?;
+    // 17 — типографское начертание («Semibold Italic»), 2 — обычное.
+    let style = face_name(&face, 17)
+        .or_else(|| face_name(&face, 2))
+        .unwrap_or_else(|| "Regular".to_owned());
 
+    let weight = face.weight().to_number();
     Some(FaceInfo {
         family,
-        bold: face.is_bold(),
+        // Флаг из заголовка ненадёжен у промежуточных весов: Semibold часто
+        // помечен как обычный. Вес честнее.
+        bold: face.is_bold() || weight >= 600,
         italic: face.is_italic() || face.is_oblique(),
+        style,
+        weight,
+        variable: face.is_variable(),
         path: path.to_path_buf(),
     })
 }
@@ -526,6 +595,44 @@ mod tests {
         // Имя без пробелов и с хвостом начертания обязано находиться.
         let as_in_pdf = format!("{}-Regular", installed.replace(' ', ""));
         assert_eq!(fonts.find_family(&as_in_pdf), Some(installed.as_str()));
+    }
+
+    #[test]
+    fn resolve_prefers_upright_over_weight_and_statics_over_variables() {
+        let face = |style: &str, bold: bool, italic: bool, weight: u16, variable: bool| FaceInfo {
+            family: "Проба".into(),
+            bold,
+            italic,
+            style: style.into(),
+            weight,
+            variable,
+            path: PathBuf::from(format!("{style}.ttf")),
+        };
+        let fonts = SystemFonts {
+            faces: vec![
+                face("Italic", false, true, 400, false),
+                face("Regular", false, false, 400, false),
+                face("Variable", false, false, 400, true),
+            ],
+        };
+
+        // Прямой запрос не должен садиться курсивом, пока есть прямое.
+        let upright = fonts
+            .resolve(&FontRequest::new("Проба", false, false))
+            .expect("семейство есть");
+        assert_eq!(upright.style, "Regular");
+
+        // Полужирного нет — но лучше прямое обычное, чем курсив.
+        let bold = fonts
+            .resolve(&FontRequest::new("Проба", true, false))
+            .expect("семейство есть");
+        assert_eq!(bold.style, "Regular");
+
+        // Точное имя начертания главнее флагов.
+        let exact = fonts
+            .resolve(&FontRequest::new("Проба", false, false).with_face("Italic"))
+            .expect("семейство есть");
+        assert_eq!(exact.style, "Italic");
     }
 
     #[test]

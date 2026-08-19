@@ -17,7 +17,6 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::Input;
-use gpui_component::select::Select;
 use gpui_component::{ActiveTheme, Sizable, StyledExt};
 
 use pdfcore::model::Align;
@@ -25,6 +24,68 @@ use pdfcore::stream_edit::Script;
 
 use crate::rich_text::RunStyle;
 use crate::viewer::{Viewer, align_label};
+
+impl Viewer {
+    /// Кнопка выбора шрифта: показывает текущую гарнитуру её же начертанием и
+    /// открывает раскрывающийся список — семейства с начертаниями внутри.
+    fn font_choice_button(
+        &self,
+        id: &'static str,
+        target: crate::viewer::FontTarget,
+        cx: &mut gpui::Context<Self>,
+    ) -> impl IntoElement {
+        let (family, face) = match target {
+            crate::viewer::FontTarget::Editor => {
+                (self.chosen_family.clone(), self.chosen_face.clone())
+            }
+            crate::viewer::FontTarget::Multi => (self.multi_family.clone(), None),
+        };
+        let shown = family.clone().unwrap_or_else(|| "Гарнитура…".to_owned());
+        let title = match &face {
+            Some(face) => format!("{shown} · {face}"),
+            None => shown.clone(),
+        };
+        h_flex()
+            .id(id)
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .cursor_pointer()
+            .hover(|el| el.bg(cx.theme().accent))
+            .child(
+                div()
+                    .flex_1()
+                    .text_sm()
+                    .truncate()
+                    .when(family.is_some(), |el| {
+                        el.font_family(gpui::SharedString::from(shown))
+                    })
+                    .when(family.is_none(), |el| {
+                        el.text_color(cx.theme().muted_foreground)
+                    })
+                    .child(title),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("▾"),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _: &gpui::MouseDownEvent, window, cx| {
+                    this.toggle_font_picker(target, window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+    }
+}
 
 /// Ширина панели. Хватает на две колонки полей и не съедает страницу.
 pub(crate) const PANEL_WIDTH: f32 = 268.0;
@@ -157,12 +218,15 @@ impl Viewer {
                     .child(heading("ФОРМАТ", muted))
                     // Гарнитура и кегль живут здесь, как в Acrobat: панель
                     // всегда на месте, а плавающая у блока остаётся короткой.
-                    .children(self.widgets.as_ref().map(|widgets| {
-                        let family_select = widgets.family.clone();
+                    .children(self.widgets.as_ref().map(|_| {
                         h_flex()
                             .items_center()
                             .gap_1()
-                            .child(div().flex_1().child(Select::new(&family_select).small()))
+                            .child(div().flex_1().child(self.font_choice_button(
+                                "editor-font",
+                                crate::viewer::FontTarget::Editor,
+                                cx,
+                            )))
                             .child(
                                 Button::new("refresh-fonts")
                                     .small()
@@ -475,12 +539,16 @@ impl Viewer {
                     }),
                 ),
             )
-            .children(self.multi_family.as_ref().map(|family| {
+            .child(
                 v_flex()
                     .gap_0p5()
                     .child(label("Гарнитура", muted))
-                    .child(Select::new(family).small())
-            }))
+                    .child(self.font_choice_button(
+                        "multi-font",
+                        crate::viewer::FontTarget::Multi,
+                        cx,
+                    )),
+            )
             .children(self.multi_color.as_ref().map(|color| {
                 h_flex()
                     .items_center()

@@ -1259,6 +1259,9 @@ fn spans_from_block(block: &Block, def: &crate::StyleDef) -> Vec<crate::stream_e
                 color: colour,
                 script: crate::stream_edit::Script::Baseline,
                 underline: def.underline,
+                // Начертание из стиля: каскад одевает блок целиком.
+                bold: def.bold,
+                italic: def.italic,
             });
         }
     }

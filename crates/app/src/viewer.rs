@@ -19,9 +19,8 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, img, list, px, rgba, white,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{InputEvent, InputState};
-use gpui_component::select::{SearchableVec, SelectEvent, SelectState};
-use gpui_component::{ActiveTheme, IndexPath, Sizable};
+use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::{ActiveTheme, Sizable};
 use image::{Frame, RgbaImage};
 use pdfcore::cache::{DEFAULT_TILE_BUDGET, THUMBNAIL_HEIGHT_PX};
 use pdfcore::geom::Rect;
@@ -102,28 +101,27 @@ pub(crate) enum Tool {
 
 /// Пункт списка гарнитур: имя, написанное этой же гарнитурой.
 ///
-/// Название шрифта, набранное им самим, узнаётся с одного взгляда — так
-/// устроены списки во всех издательских программах. Обычная строка так не
-/// умеет, поэтому у списка свой пункт.
-#[derive(Clone, PartialEq)]
-pub(crate) struct FamilyName(pub String);
+/// Кому пикер выбирает шрифт.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FontTarget {
+    /// Правимому блоку — панель свойств одиночного выделения.
+    Editor,
+    /// Группе блоков.
+    Multi,
+}
 
-impl gpui_component::select::SelectItem for FamilyName {
-    type Value = String;
-
-    fn title(&self) -> gpui::SharedString {
-        self.0.clone().into()
-    }
-
-    fn value(&self) -> &String {
-        &self.0
-    }
-
-    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
-        div()
-            .font_family(gpui::SharedString::from(self.0.clone()))
-            .child(self.0.clone())
-    }
+/// Раскрывающийся список шрифтов — как в издательских пакетах: семейства с
+/// начертаниями внутри. Обычный выпадающий список умеет показать только
+/// плоский перечень имён, а здесь у каждого семейства раскрывается свой
+/// список: Light, Regular, Semibold, Italic…
+pub(crate) struct FontPickerUi {
+    pub target: FontTarget,
+    /// Строка поиска по именам семейств.
+    pub query: Entity<InputState>,
+    /// Раскрытые семейства.
+    pub expanded: HashSet<String>,
+    /// Прокрутка списка.
+    pub scroll: gpui::ScrollHandle,
 }
 
 /// Состояние режима «Систематизировать страницы».
@@ -319,7 +317,6 @@ pub(crate) struct EditWidgets {
     /// умеет разные шрифты внутри одного абзаца.
     pub editor: Entity<RichTextEditor>,
     pub size: Entity<InputState>,
-    pub family: Entity<SelectState<SearchableVec<FamilyName>>>,
     pub geometry: GeometryInputs,
     /// Палитра своего цвета: свотчей мало, а книга красит текст как хочет.
     pub color: Entity<gpui_component::color_picker::ColorPickerState>,
@@ -521,7 +518,9 @@ pub struct Viewer {
     /// как в Acrobat.
     pub(crate) multi_size: Option<Entity<InputState>>,
     /// Гарнитура для всей группы: выбор в списке перенабирает каждый блок.
-    pub(crate) multi_family: Option<Entity<SelectState<SearchableVec<FamilyName>>>>,
+    /// Гарнитура, выбранная для группы. Пустая, пока не выбирали, — как в
+    /// Acrobat: без общего значения показывать нечего.
+    pub(crate) multi_family: Option<String>,
     /// Свой цвет для всей группы — палитра, как у одиночного блока.
     pub(crate) multi_color: Option<Entity<gpui_component::color_picker::ColorPickerState>>,
     /// Углы всех видимых страниц в координатах окна: мышь приходит в оконных,
@@ -541,6 +540,13 @@ pub struct Viewer {
     page_origins_next: HashMap<u32, Vec<Point<Pixels>>>,
     /// Активный инструмент нижней панели.
     pub(crate) tool: Tool,
+    /// Открытый список выбора шрифта.
+    pub(crate) font_picker: Option<FontPickerUi>,
+    /// Гарнитура, выбранная в списке для правимого блока. `None` — гарнитура
+    /// блока не менялась.
+    pub(crate) chosen_family: Option<String>,
+    /// Точное начертание, если его выбрали в раскрытом семействе.
+    pub(crate) chosen_face: Option<String>,
     /// Правимому абзацу нужно отдать клавиатуру на ближайшей отрисовке.
     focus_editor: bool,
     /// Просьба вернуть клавиатуру самому виду: в сетке страниц горячие
@@ -604,6 +610,9 @@ impl Viewer {
             group_drag: None,
             pending_press: None,
             rubber: None,
+            font_picker: None,
+            chosen_family: None,
+            chosen_face: None,
             tool: Tool::default(),
             multi: Vec::new(),
             multi_size: None,
@@ -1089,7 +1098,7 @@ impl Viewer {
             "выделен блок: оформление от pdfium"
         );
         let line_height = block.leading().unwrap_or(size * 1.2);
-        let (widgets, hint) = build_widgets(
+        let (widgets, preselected, hint) = build_widgets(
             model,
             size,
             &family,
@@ -1099,6 +1108,10 @@ impl Viewer {
             window,
             cx,
         );
+        // Выбор пикера начинается с гарнитуры блока; точного начертания нет,
+        // пока его не выбрали руками.
+        self.chosen_family = preselected;
+        self.chosen_face = None;
 
         // Клик по абзацу должен сразу давать печатать. Фокус ставится не
         // здесь, а на следующем кадре: элемент правки в этот миг ещё не
@@ -1120,13 +1133,6 @@ impl Viewer {
         )
         .detach();
 
-        // Смена гарнитуры и кегля в панели свойств обязана попадать на
-        // страницу немедленно: кнопки «Применить» больше нет, и без этих
-        // подписок выбор в панели просто пропадал бы при щелчке мимо.
-        cx.subscribe(&widgets.family, |this, _, _: &SelectEvent<_>, cx| {
-            this.request_preview(cx);
-        })
-        .detach();
         // Поля геометрии и метрик: применяются по Enter и уходу фокуса.
         let geometry_subscriptions: [(
             &Entity<InputState>,
@@ -1293,7 +1299,7 @@ impl Viewer {
             let zoom = self.doc.as_ref().map(|doc| doc.zoom).unwrap_or(1.0);
             let wrap_width = px(selection.bbox.width() * zoom);
             let line_height = selection.line_height.unwrap_or(size * 1.2);
-            let (rebuilt, _) = build_widgets(
+            let (rebuilt, preselected, _) = build_widgets(
                 model,
                 size,
                 &family,
@@ -1303,6 +1309,8 @@ impl Viewer {
                 window,
                 cx,
             );
+            self.chosen_family = preselected;
+            self.chosen_face = None;
             window.focus(&rebuilt.editor.read(cx).focus_handle(cx));
             self.widgets = Some(rebuilt);
         }
@@ -1566,7 +1574,7 @@ impl Viewer {
         });
 
         let zoom = self.doc.as_ref().map(|doc| doc.zoom).unwrap_or(1.0);
-        let (widgets, hint) = build_widgets(
+        let (widgets, preselected, hint) = build_widgets(
             RichText::new(String::new(), RunStyle::default()),
             12.0,
             "Arial",
@@ -1576,6 +1584,8 @@ impl Viewer {
             window,
             cx,
         );
+        self.chosen_family = preselected;
+        self.chosen_face = None;
         cx.subscribe_in(
             &widgets.editor,
             window,
@@ -1584,10 +1594,6 @@ impl Viewer {
                 EditorEvent::Changed => this.request_preview(cx),
             },
         )
-        .detach();
-        cx.subscribe(&widgets.family, |this, _, _: &SelectEvent<_>, cx| {
-            this.request_preview(cx);
-        })
         .detach();
         // Поля геометрии и метрик: применяются по Enter и уходу фокуса.
         let geometry_subscriptions: [(
@@ -1723,20 +1729,9 @@ impl Viewer {
         .detach();
         self.multi_size = Some(input);
 
-        // Гарнитура группы: список системных семейств, каждое своим шрифтом.
-        // Без общего значения выбор пуст — как в Acrobat.
-        let families = pdfcore::system_fonts().families();
-        let items: Vec<FamilyName> = families.into_iter().map(FamilyName).collect();
-        let family_select = cx.new(|cx| {
-            SelectState::new(SearchableVec::new(items), None, window, cx).searchable(true)
-        });
-        cx.subscribe(&family_select, |this, state, _: &SelectEvent<_>, cx| {
-            if let Some(family) = state.read(cx).selected_value().cloned() {
-                this.multi_restyle(move |style| style.family = Some(family.clone()), cx);
-            }
-        })
-        .detach();
-        self.multi_family = Some(family_select);
+        // Гарнитура группы выбирается пикером шрифтов; пока не выбирали,
+        // значения нет — как в Acrobat.
+        self.multi_family = None;
 
         let color = cx.new(|cx| gpui_component::color_picker::ColorPickerState::new(window, cx));
         cx.subscribe(
@@ -2568,11 +2563,9 @@ impl Viewer {
         let selection = self.selected.as_ref()?;
         let widgets = self.widgets.as_ref()?;
 
-        let family = widgets
-            .family
-            .read(cx)
-            .selected_value()
-            .cloned()
+        let family = self
+            .chosen_family
+            .clone()
             .unwrap_or_else(|| selection.style.clean_family().to_owned());
         let size = widgets
             .size
@@ -2694,7 +2687,15 @@ impl Viewer {
         {
             for span in &mut edit.spans {
                 if span.font.is_none() {
-                    span.font = Some(pdfcore::FontRequest::new(&family, false, false));
+                    // Начертание куска сохраняется: жирное начало абзаца
+                    // остаётся жирным и в новой гарнитуре.
+                    let mut request = pdfcore::FontRequest::new(&family, span.bold, span.italic);
+                    // Точное начертание из пикера главнее флагов — его
+                    // выбрали руками из списка семейства.
+                    if let Some(face) = self.chosen_face.as_ref() {
+                        request = request.with_face(face.clone());
+                    }
+                    span.font = Some(request);
                     span.page_family = None;
                 }
             }
@@ -2722,7 +2723,7 @@ impl Viewer {
         if let Some(chosen) = manual.or(auto) {
             for span in &mut edit.spans {
                 if span.font.is_none() {
-                    span.font = Some(pdfcore::FontRequest::new(&chosen, false, false));
+                    span.font = Some(pdfcore::FontRequest::new(&chosen, span.bold, span.italic));
                     span.page_family = None;
                 }
             }
@@ -3279,6 +3280,11 @@ impl Viewer {
         // Открытое меню перехватывает Esc: сперва закрывается оно.
         if self.panel_menu.is_some() && event.keystroke.key == "escape" {
             self.panel_menu = None;
+            cx.notify();
+            return;
+        }
+        if self.font_picker.is_some() && event.keystroke.key == "escape" {
+            self.font_picker = None;
             cx.notify();
             return;
         }
@@ -4769,6 +4775,285 @@ impl Viewer {
         cx.notify();
     }
 
+    /// Открывает и закрывает список выбора шрифта.
+    pub(crate) fn toggle_font_picker(
+        &mut self,
+        target: FontTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .font_picker
+            .as_ref()
+            .is_some_and(|picker| picker.target == target)
+        {
+            self.font_picker = None;
+            cx.notify();
+            return;
+        }
+        let query = cx.new(|cx| InputState::new(window, cx).placeholder("Поиск шрифта…"));
+        // Набор в поиске перерисовывает список на каждом знаке.
+        cx.observe(&query, |_, _, cx| cx.notify()).detach();
+        // Клавиатура сразу в поиск: иначе набор уйдёт в правимый блок.
+        window.focus(&query.read(cx).focus_handle(cx));
+        self.font_picker = Some(FontPickerUi {
+            target,
+            query,
+            expanded: HashSet::new(),
+            scroll: gpui::ScrollHandle::new(),
+        });
+        cx.notify();
+    }
+
+    /// Выбор в пикере: семейство целиком либо конкретное начертание.
+    fn pick_font(
+        &mut self,
+        family: String,
+        face: Option<pdfcore::FaceInfo>,
+        cx: &mut Context<Self>,
+    ) {
+        let target = match self.font_picker.as_ref() {
+            Some(picker) => picker.target,
+            None => return,
+        };
+        self.font_picker = None;
+        match target {
+            FontTarget::Editor => {
+                self.chosen_family = Some(family.clone());
+                self.chosen_face = face.as_ref().map(|f| f.style.clone());
+                // Точное начертание тянет за собой флаги: выбрал «Bold
+                // Italic» — кнопки Ж и К загораются сами.
+                if let Some(face) = face {
+                    let (bold, italic) = (face.bold, face.italic);
+                    if let Some(widgets) = self.widgets.as_ref() {
+                        widgets.editor.update(cx, |editor, cx| {
+                            editor.restyle(
+                                move |style| {
+                                    style.bold = bold;
+                                    style.italic = italic;
+                                },
+                                cx,
+                            );
+                        });
+                    }
+                }
+                if let Some(selection) = self.selected.as_mut() {
+                    selection.touched = true;
+                }
+                self.request_preview(cx);
+            }
+            FontTarget::Multi => {
+                self.multi_family = Some(family.clone());
+                let face_style = face.clone();
+                self.multi_restyle(
+                    move |style| {
+                        style.family = Some(family.clone());
+                        if let Some(face) = &face_style {
+                            style.bold = face.bold;
+                            style.italic = face.italic;
+                        }
+                    },
+                    cx,
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    /// Список шрифтов поверх окна: семейства с раскрывающимися начертаниями.
+    fn render_font_picker(
+        &mut self,
+        viewport: gpui::Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let picker = self.font_picker.as_ref()?;
+        let query = picker.query.read(cx).value().trim().to_lowercase();
+        let expanded = picker.expanded.clone();
+        let scroll = picker.scroll.clone();
+        let query_state = picker.query.clone();
+
+        let fonts = pdfcore::system_fonts();
+        let families: Vec<String> = fonts
+            .families()
+            .into_iter()
+            .filter(|family| query.is_empty() || family.to_lowercase().contains(&query))
+            .collect();
+
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let hover = cx.theme().accent;
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (index, family) in families.into_iter().enumerate() {
+            let faces = fonts.faces_of(&family);
+            let open = expanded.contains(&family);
+            let family_for_toggle = family.clone();
+            let family_for_pick = family.clone();
+
+            rows.push(
+                h_flex()
+                    .id(("font-family", index))
+                    .w_full()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|el| el.bg(hover))
+                    // Стрелка раскрывает начертания, не выбирая семейства.
+                    .child(
+                        div()
+                            .id(("font-expand", index))
+                            .w(px(18.0))
+                            .h(px(18.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(muted)
+                            .hover(|el| el.bg(border))
+                            .child(if open { "▾" } else { "▸" })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                    if let Some(picker) = this.font_picker.as_mut() {
+                                        if !picker.expanded.remove(&family_for_toggle) {
+                                            picker.expanded.insert(family_for_toggle.clone());
+                                        }
+                                        cx.notify();
+                                    }
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .truncate()
+                            .font_family(gpui::SharedString::from(family.clone()))
+                            .child(family.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(format!("{}", faces.len())),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            this.pick_font(family_for_pick.clone(), None, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .into_any_element(),
+            );
+
+            if open {
+                for (face_ix, face) in faces.into_iter().enumerate() {
+                    let family_for_face = family.clone();
+                    let shown_face = face.clone();
+                    rows.push(
+                        h_flex()
+                            .id(("font-face", index * 100 + face_ix))
+                            .w_full()
+                            .items_center()
+                            .pl(px(30.0))
+                            .pr_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|el| el.bg(hover))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_sm()
+                                    .truncate()
+                                    .font_family(gpui::SharedString::from(family.clone()))
+                                    .when(face.bold, |el| el.font_weight(gpui::FontWeight::BOLD))
+                                    .when(face.italic, |el| el.italic())
+                                    .child(face.style.clone()),
+                            )
+                            .children(
+                                face.variable
+                                    .then(|| div().text_xs().text_color(muted).child("VAR")),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                    this.pick_font(
+                                        family_for_face.clone(),
+                                        Some(shown_face.clone()),
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+
+        // Карточка стоит у правой панели — там живут обе кнопки выбора.
+        let width = px(340.0);
+        let height = (f32::from(viewport.height) - 160.0).max(240.0);
+        let _ = viewport;
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.font_picker = None;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    v_flex()
+                        .absolute()
+                        .top(px(96.0))
+                        .right(px(crate::properties::PANEL_WIDTH + 12.0))
+                        .w(width)
+                        .h(px(height))
+                        .rounded_lg()
+                        .bg(cx.theme().popover)
+                        .border_1()
+                        .border_color(border)
+                        .shadow_lg()
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                        )
+                        .child(
+                            div()
+                                .p_2()
+                                .border_b_1()
+                                .border_color(border)
+                                .child(Input::new(&query_state).small()),
+                        )
+                        .child(
+                            v_flex()
+                                .id("font-picker-list")
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .p_1()
+                                .track_scroll(&scroll)
+                                .overflow_y_scroll()
+                                .children(rows),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// Открывает окно «Стили» и просит каталог у движка.
     pub(crate) fn open_styles(&mut self, cx: &mut Context<Self>) {
         self.styles_window = Some(StylesWindow {
@@ -6068,6 +6353,7 @@ impl Render for Viewer {
         let status = self.render_status(cx);
         let properties = self.render_properties(cx);
         let panel_menu = self.render_panel_menu(window.viewport_size(), cx);
+        let font_picker = self.render_font_picker(window.viewport_size(), cx);
         let fonts_window = self.render_fonts_window(cx);
         let styles_window = self.render_styles_window(cx);
 
@@ -6091,6 +6377,7 @@ impl Render for Viewer {
             .children(fonts_window)
             .children(styles_window)
             .children(panel_menu)
+            .children(font_picker)
     }
 }
 
@@ -6203,7 +6490,7 @@ fn build_widgets(
     zoom: f32,
     window: &mut Window,
     cx: &mut Context<Viewer>,
-) -> (EditWidgets, Option<String>) {
+) -> (EditWidgets, Option<String>, Option<String>) {
     let base = BaseStyle {
         metrics_by_family: std::collections::HashMap::new(),
         size_points: size,
@@ -6228,16 +6515,7 @@ fn build_widgets(
     // сканирования шрифтов, которое стартует при открытии документа.
     let families = pdfcore::system_fonts().families();
     let (selected, hint) = preselect_family(&families, family);
-    let items: Vec<FamilyName> = families.into_iter().map(FamilyName).collect();
-    let family_state = cx.new(|cx| {
-        SelectState::new(
-            SearchableVec::new(items),
-            selected.map(IndexPath::new),
-            window,
-            cx,
-        )
-        .searchable(true)
-    });
+    let preselected = selected.map(|index| families[index].clone());
 
     let number =
         |window: &mut Window, cx: &mut Context<Viewer>| cx.new(|cx| InputState::new(window, cx));
@@ -6258,11 +6536,11 @@ fn build_widgets(
         EditWidgets {
             editor,
             size: size_state,
-            family: family_state,
             geometry,
             color,
             fill,
         },
+        preselected,
         hint,
     )
 }

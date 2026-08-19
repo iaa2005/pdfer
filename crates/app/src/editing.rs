@@ -616,10 +616,8 @@ impl Viewer {
             .iter()
             .position(|f| f.eq_ignore_ascii_case(&template.family))
         {
-            let select = widgets.family.clone();
-            select.update(cx, |state, cx| {
-                state.set_selected_index(Some(gpui_component::IndexPath::new(index)), window, cx);
-            });
+            self.chosen_family = Some(families[index].clone());
+            self.chosen_face = None;
         }
 
         let size_input = widgets.size.clone();
