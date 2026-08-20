@@ -1116,6 +1116,7 @@ impl Viewer {
             &family,
             line_height,
             wrap_width,
+            block.align,
             zoom,
             window,
             cx,
@@ -1372,6 +1373,7 @@ impl Viewer {
                 &family,
                 line_height,
                 wrap_width,
+                selection.align,
                 zoom,
                 window,
                 cx,
@@ -1648,6 +1650,7 @@ impl Viewer {
             "Arial",
             14.4,
             px(rect.width() * zoom),
+            pdfcore::model::Align::Left,
             zoom,
             window,
             cx,
@@ -6694,12 +6697,14 @@ fn build_widgets(
     family: &str,
     line_height: f32,
     wrap_width: Pixels,
+    align: pdfcore::model::Align,
     zoom: f32,
     window: &mut Window,
     cx: &mut Context<Viewer>,
 ) -> (EditWidgets, Option<String>, Option<String>) {
     let base = BaseStyle {
         metrics_by_family: std::collections::HashMap::new(),
+        align,
         size_points: size,
         line_height_points: line_height,
         // Рамка лежит поверх страницы, отрисованной с этим масштабом, — значит

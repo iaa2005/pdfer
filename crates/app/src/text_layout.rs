@@ -40,6 +40,9 @@ pub struct BaseStyle {
     /// полужирные буквы шире обычных, и одна общая линейка на всех гнула
     /// раскладку — слова «прыгали» относительно настоящей страницы.
     pub metrics_by_family: std::collections::HashMap<String, Encoder>,
+    /// Выключка абзаца. Строки поля правки ложатся так же, как на странице:
+    /// центрованный заголовок и в поле стоит по центру, а не прижат влево.
+    pub align: pdfcore::model::Align,
 }
 
 /// Слово или промежуток между словами, уже обмеренные.
@@ -95,11 +98,8 @@ impl TextLayout {
         } else {
             base.size_points * 1.2
         };
-        let lines = wrap(
-            &pieces,
-            (f32::from(wrap_width) / scale).max(1.0),
-            line_height,
-        );
+        let wrap_points = (f32::from(wrap_width) / scale).max(1.0);
+        let lines = wrap(&pieces, wrap_points, line_height, base.align);
 
         let width = lines
             .iter()
@@ -115,6 +115,13 @@ impl TextLayout {
             .map(|line| line.top + line.height)
             .unwrap_or(line_height);
 
+        // При выключке не влево элемент занимает всю ширину блока: строки
+        // сдвинуты внутри неё, и рамка обнимает блок, как на странице.
+        let width = if base.align == pdfcore::model::Align::Left {
+            width
+        } else {
+            width.max(wrap_points)
+        };
         TextLayout {
             pieces,
             lines,
@@ -329,7 +336,12 @@ fn tokenize(text: &str) -> Vec<Range<usize>> {
     tokens
 }
 
-fn wrap(pieces: &[Piece], wrap_width: f32, line_height: f32) -> Vec<LaidLine> {
+fn wrap(
+    pieces: &[Piece],
+    wrap_width: f32,
+    line_height: f32,
+    align: pdfcore::model::Align,
+) -> Vec<LaidLine> {
     let mut lines: Vec<LaidLine> = Vec::new();
     let mut placed: Vec<Placed> = Vec::new();
     let mut x = 0.0f32;
@@ -338,6 +350,28 @@ fn wrap(pieces: &[Piece], wrap_width: f32, line_height: f32) -> Vec<LaidLine> {
     let close = |placed: &mut Vec<Placed>, lines: &mut Vec<LaidLine>, top: &mut f32| {
         if placed.is_empty() {
             return;
+        }
+        // Выключка: строка сдвигается внутри ширины блока, как на странице.
+        // Хвостовые пробелы в ширину не считаются — они не рисуются и не
+        // должны утаскивать центр влево.
+        let line_width = placed
+            .iter()
+            .rev()
+            .find(|p| !pieces[p.piece].blank)
+            .map(|p| p.x + pieces[p.piece].width)
+            .unwrap_or(0.0);
+        let free = (wrap_width - line_width).max(0.0);
+        let shift = match align {
+            pdfcore::model::Align::Center => free / 2.0,
+            pdfcore::model::Align::Right => free,
+            // Выключку по формату страница делает раздвижкой пробелов; в поле
+            // правки она видна как левая — этого достаточно для набора.
+            pdfcore::model::Align::Left | pdfcore::model::Align::Justify => 0.0,
+        };
+        if shift > 0.0 {
+            for p in placed.iter_mut() {
+                p.x += shift;
+            }
         }
         let range = pieces[placed[0].piece].range.start
             ..pieces[placed.last().expect("непусто").piece].range.end;
@@ -397,6 +431,7 @@ mod tests {
 
     fn base(scale: f32) -> BaseStyle {
         BaseStyle {
+            align: pdfcore::model::Align::Left,
             metrics_by_family: std::collections::HashMap::new(),
             size_points: 10.0,
             line_height_points: 12.0,
@@ -530,6 +565,25 @@ mod tests {
         assert!((f32::from(at_two.x) - f32::from(at_one.x) * 2.0).abs() < 0.01);
         assert!((f32::from(height_two) - f32::from(height_one) * 2.0).abs() < 0.01);
         assert!((f32::from(two.width) - f32::from(one.width) * 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn centered_paragraph_lays_out_centered() {
+        // Центрованный заголовок и в поле правки стоит по центру: строка
+        // сдвигается на половину свободного места, ширина элемента — вся
+        // ширина блока.
+        let mut base = base(1.0);
+        base.align = pdfcore::model::Align::Center;
+        let layout = TextLayout::build(&model("аб"), &base, px(100.0));
+        // Строка из двух букв по полкегля: 10 пт при кегле 10. Свободно 90,
+        // сдвиг 45.
+        let (caret, _) = layout.caret(0);
+        assert!(
+            (f32::from(caret.x) - 45.0).abs() < 0.5,
+            "каретка в начале строки должна стоять на сдвиге: {:?}",
+            caret.x
+        );
+        assert_eq!(f32::from(layout.width), 100.0);
     }
 
     #[test]

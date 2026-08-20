@@ -548,6 +548,14 @@ impl Viewer {
         }
         selection.align = align;
         selection.needs_retypeset = true;
+        // Поле правки перекладывает строки сразу: выключка видна и в наборе,
+        // а не только на странице после применения.
+        if let Some(widgets) = self.widgets.as_ref() {
+            widgets.editor.update(cx, |editor, cx| {
+                editor.base.align = align;
+                cx.notify();
+            });
+        }
         self.request_preview(cx);
     }
 
