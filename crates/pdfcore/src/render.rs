@@ -979,14 +979,25 @@ fn apply_batch(
         .ok_or_else(|| anyhow::anyhow!("нет страницы {page_number}"))?;
     let before = document.get_page_content(page_id);
 
+    // Негодный блок пропускается, а не валит пачку: в групповое выделение
+    // попадают и подписи к рисункам из шрифтов-подмножеств, которые нечем
+    // перенабрать, — из-за одного такого блока раньше отменялось всё
+    // действие. Пропущенное честно возвращается вызывающему. Откат при этом
+    // остаётся одним шагом истории: записывается один снимок содержимого.
+    let mut skipped = Vec::new();
     for edit in edits {
         if let Err(e) = edit.apply(document) {
-            // Всё или ничего: уже применённая часть пачки откатывается.
-            document
-                .change_page_content(page_id, before.clone())
-                .map_err(|inner| anyhow::anyhow!("не удалось откатить пачку: {inner}"))?;
-            return Err(e);
+            skipped.push(format!("{e:#}"));
         }
+    }
+    if skipped.len() == edits.len()
+        && let Some(first) = skipped.first()
+    {
+        // Не вышло ничего — содержимое не трогалось, шаг истории не нужен.
+        document
+            .change_page_content(page_id, before.clone())
+            .map_err(|inner| anyhow::anyhow!("не удалось откатить пачку: {inner}"))?;
+        return Err(anyhow::anyhow!("{first}"));
     }
 
     history.record(HistoryStep::Content {
@@ -994,6 +1005,13 @@ fn apply_batch(
         before,
         after: document.get_page_content(page_id),
     });
+    if !skipped.is_empty() {
+        tracing::warn!(
+            skipped = skipped.len(),
+            first = %skipped[0],
+            "часть блоков пачки пропущена"
+        );
+    }
     Ok(())
 }
 

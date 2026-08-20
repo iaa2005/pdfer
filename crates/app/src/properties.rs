@@ -288,25 +288,28 @@ impl Viewer {
                                 },
                             )),
                     )
+                    // Каждое поле своей строкой: парой они упирались в край
+                    // панели, и подпись «Гор. масштаб» обрезало.
                     .children(self.widgets.as_ref().map(|widgets| {
-                        let g = &widgets.geometry;
-                        pair(
-                            preset_field(
-                                "Межбуквенный, пт",
-                                "icons/text-tracking.svg",
-                                &g.char_spacing,
-                                crate::viewer::PresetKind::CharSpacing,
-                                muted,
-                                cx,
-                            ),
-                            preset_field(
-                                "Гор. масштаб, %",
-                                "icons/text-horizontal-scale.svg",
-                                &g.h_scale,
-                                crate::viewer::PresetKind::HScale,
-                                muted,
-                                cx,
-                            ),
+                        preset_field(
+                            "Межбуквенный, пт",
+                            "icons/text-tracking.svg",
+                            &widgets.geometry.char_spacing,
+                            crate::viewer::PresetKind::CharSpacing,
+                            crate::viewer::PresetTarget::Editor,
+                            muted,
+                            cx,
+                        )
+                    }))
+                    .children(self.widgets.as_ref().map(|widgets| {
+                        preset_field(
+                            "Гор. масштаб, %",
+                            "icons/text-horizontal-scale.svg",
+                            &widgets.geometry.h_scale,
+                            crate::viewer::PresetKind::HScale,
+                            crate::viewer::PresetTarget::Editor,
+                            muted,
+                            cx,
                         )
                     }))
                     .child(label("Цвет", muted))
@@ -411,6 +414,7 @@ impl Viewer {
                             .child(preset_arrow(
                                 "leading-presets",
                                 crate::viewer::PresetKind::LineHeight,
+                                crate::viewer::PresetTarget::Editor,
                                 muted,
                                 cx,
                             ))
@@ -425,7 +429,8 @@ impl Viewer {
                             )
                             .child(
                                 div()
-                                    .min_w(px(46.0))
+                                    .min_w(px(56.0))
+                                    .whitespace_nowrap()
                                     .text_xs()
                                     .child(format!("{leading:.1} пт")),
                             )
@@ -445,6 +450,10 @@ impl Viewer {
                 v_flex()
                     .p_3()
                     .gap_1()
+                    // Стиль блока правится прямо здесь и каскадом
+                    // перенабирает все блоки этого стиля — как в окне
+                    // «Стили», только не отходя от выделения.
+                    .children(self.render_style_section(muted, cx))
                     // Всё, что прочитано из самого файла. Меняться отсюда
                     // ничего не может — это и есть ценность: видно, с чем
                     // имеешь дело, прежде чем что-то трогать.
@@ -507,6 +516,49 @@ impl Viewer {
                     .child(div().w(px(72.0)).child(Input::new(input).small()))
                     .child(label("пт — пусто, если разный", muted))
             }))
+            // Типографика группы — те же поля и пресеты, что у одиночного
+            // блока: значение ложится на каждый блок группы.
+            .children(self.multi_char_spacing.clone().map(|input| {
+                preset_field(
+                    "Межбуквенный, пт",
+                    "icons/text-tracking.svg",
+                    &input,
+                    crate::viewer::PresetKind::CharSpacing,
+                    crate::viewer::PresetTarget::Multi,
+                    muted,
+                    cx,
+                )
+            }))
+            .children(self.multi_h_scale.clone().map(|input| {
+                preset_field(
+                    "Гор. масштаб, %",
+                    "icons/text-horizontal-scale.svg",
+                    &input,
+                    crate::viewer::PresetKind::HScale,
+                    crate::viewer::PresetTarget::Multi,
+                    muted,
+                    cx,
+                )
+            }))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        gpui_component::Icon::empty()
+                            .path("icons/line-spacing.svg")
+                            .size_4()
+                            .text_color(muted),
+                    )
+                    .child(label("Интерлиньяж, × кегля", muted))
+                    .child(preset_arrow(
+                        "multi-leading-presets",
+                        crate::viewer::PresetKind::LineHeight,
+                        crate::viewer::PresetTarget::Multi,
+                        muted,
+                        cx,
+                    )),
+            )
             .child(
                 h_flex()
                     .gap_1()
@@ -648,6 +700,97 @@ fn align_icon(align: Align) -> &'static str {
 }
 
 /// Подписанное числовое поле панели.
+impl Viewer {
+    /// Секция «Стиль» панели свойств: имя, начертание и кегль стиля блока.
+    /// Любая правка тут же перенабирает все блоки стиля.
+    fn render_style_section(&self, muted: Hsla, cx: &mut gpui::Context<Self>) -> Option<Div> {
+        let style_id = self.selected.as_ref()?.style_id?;
+        let def = self
+            .doc
+            .as_ref()?
+            .styles
+            .iter()
+            .find(|def| def.id == style_id)?
+            .clone();
+        let id = def.id;
+        let (bold, italic, underline) = (def.bold, def.italic, def.underline);
+        let shown_family = def
+            .family
+            .clone()
+            .unwrap_or_else(|| "Гарнитура блока".into());
+        let size_text = def
+            .size
+            .map(|size| format!("{size:.1} пт"))
+            .unwrap_or_else(|| "кегль блока".into());
+
+        Some(
+            v_flex()
+                .gap_1()
+                .child(heading("СТИЛЬ", muted))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().text_sm().child(def.name.clone()))
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .id("style-open-window")
+                                .text_xs()
+                                .text_color(muted)
+                                .cursor_pointer()
+                                .hover(|el| el.text_color(cx.theme().foreground))
+                                .child("Все стили…")
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
+                                        this.open_styles(cx);
+                                        cx.stop_propagation();
+                                    }),
+                                ),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_xs()
+                                .text_color(muted)
+                                .truncate()
+                                .child(format!("{shown_family} · {size_text}")),
+                        )
+                        .child(style_toggle(
+                            cx,
+                            "style-bold",
+                            "Ж",
+                            bold,
+                            move |this, cx| this.change_style(id, cx, |def| def.bold = !bold),
+                        ))
+                        .child(style_toggle(
+                            cx,
+                            "style-italic",
+                            "К",
+                            italic,
+                            move |this, cx| this.change_style(id, cx, |def| def.italic = !italic),
+                        ))
+                        .child(style_toggle(
+                            cx,
+                            "style-underline",
+                            "Ч",
+                            underline,
+                            move |this, cx| {
+                                this.change_style(id, cx, |def| def.underline = !underline)
+                            },
+                        )),
+                )
+                .child(divider(cx.theme().border)),
+        )
+    }
+}
+
 /// Числовое поле с иконкой и списком готовых значений: подпись, само поле и
 /// стрелка, раскрывающая пресеты, — как в настольных редакторах.
 fn preset_field(
@@ -655,6 +798,7 @@ fn preset_field(
     icon: &'static str,
     state: &gpui::Entity<gpui_component::input::InputState>,
     kind: crate::viewer::PresetKind,
+    target: crate::viewer::PresetTarget,
     muted: Hsla,
     cx: &mut gpui::Context<Viewer>,
 ) -> Div {
@@ -678,7 +822,7 @@ fn preset_field(
                 .items_center()
                 .gap_0p5()
                 .child(div().flex_1().child(Input::new(state).small()))
-                .child(preset_arrow(title, kind, muted, cx)),
+                .child(preset_arrow(title, kind, target, muted, cx)),
         )
 }
 
@@ -686,6 +830,7 @@ fn preset_field(
 fn preset_arrow(
     id: &'static str,
     kind: crate::viewer::PresetKind,
+    target: crate::viewer::PresetTarget,
     muted: Hsla,
     cx: &mut gpui::Context<Viewer>,
 ) -> gpui::Stateful<Div> {
@@ -709,6 +854,7 @@ fn preset_arrow(
                 // прижмёт его к краю окна, если не влезет.
                 this.preset_menu = Some(crate::viewer::PresetMenu {
                     kind,
+                    target,
                     at: gpui::point(event.position.x - px(70.0), event.position.y + px(14.0)),
                 });
                 cx.stop_propagation();

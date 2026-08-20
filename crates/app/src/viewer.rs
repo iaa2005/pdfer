@@ -115,9 +115,17 @@ pub(crate) enum PresetKind {
     LineHeight,
 }
 
+/// Кому применяется готовое значение: правимому блоку или группе.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PresetTarget {
+    Editor,
+    Multi,
+}
+
 /// Раскрытый список готовых значений: у какого поля и где на экране.
 pub(crate) struct PresetMenu {
     pub kind: PresetKind,
+    pub target: PresetTarget,
     pub at: Point<Pixels>,
 }
 
@@ -397,6 +405,9 @@ pub(crate) struct Document {
     thumbs: ListState,
     /// Один кэш на оба списка: миниатюра — это тот же тайл, только в другом
     /// бакете масштаба, и разделять их незачем.
+    /// Каталог именованных стилей документа. Обновляется каждым событием
+    /// `Styles`; по нему панель свойств правит стиль выделенного блока.
+    pub(crate) styles: Vec<pdfcore::StyleDef>,
     tiles: TileCache<Arc<RenderImage>>,
     pub(crate) blocks: HashMap<u32, Vec<Block>>,
     blocks_requested: HashSet<u32>,
@@ -537,6 +548,10 @@ pub struct Viewer {
     /// Кегль в панели групповых свойств. Пустой, когда у блоков он разный, —
     /// как в Acrobat.
     pub(crate) multi_size: Option<Entity<InputState>>,
+    /// Поля типографики группы: разрядка и горизонтальный масштаб. Пустые,
+    /// пока не введено значение, — у блоков группы они могут различаться.
+    pub(crate) multi_char_spacing: Option<Entity<InputState>>,
+    pub(crate) multi_h_scale: Option<Entity<InputState>>,
     /// Гарнитура для всей группы: выбор в списке перенабирает каждый блок.
     /// Гарнитура, выбранная для группы. Пустая, пока не выбирали, — как в
     /// Acrobat: без общего значения показывать нечего.
@@ -643,6 +658,8 @@ impl Viewer {
             tool: Tool::default(),
             multi: Vec::new(),
             multi_size: None,
+            multi_char_spacing: None,
+            multi_h_scale: None,
             multi_family: None,
             multi_color: None,
             page_origins: HashMap::new(),
@@ -715,6 +732,9 @@ impl Viewer {
         })
         .detach();
 
+        // Каталог стилей нужен панели свойств с первого выделения.
+        renderer.request_styles();
+
         self.path = path;
         self.error = None;
         self.doc = Some(Document {
@@ -722,6 +742,7 @@ impl Viewer {
             info,
             pages,
             thumbs,
+            styles: Vec::new(),
             tiles: TileCache::new(DEFAULT_TILE_BUDGET),
             blocks: HashMap::new(),
             blocks_requested: HashSet::new(),
@@ -819,6 +840,9 @@ impl Viewer {
                     if changed {
                         doc.dirty = true;
                     }
+                    // Каталог держится при документе: он нужен не только окну
+                    // стилей, но и панели свойств — там правится стиль блока.
+                    doc.styles = styles.clone();
                     if let Some(window) = self.styles_window.as_mut() {
                         window.defs = styles;
                         window.loading = false;
@@ -1825,6 +1849,39 @@ impl Viewer {
         .detach();
         self.multi_size = Some(input);
 
+        // Поля типографики группы: пустые — общего значения у блоков нет.
+        let char_spacing = cx.new(|cx| InputState::new(window, cx));
+        cx.subscribe(&char_spacing, |this, state, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur)
+                && let Ok(value) = state
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .replace(',', ".")
+                    .parse::<f32>()
+            {
+                this.multi_set_char_spacing(value, cx);
+            }
+        })
+        .detach();
+        self.multi_char_spacing = Some(char_spacing);
+
+        let h_scale = cx.new(|cx| InputState::new(window, cx));
+        cx.subscribe(&h_scale, |this, state, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur)
+                && let Ok(value) = state
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .replace(',', ".")
+                    .parse::<f32>()
+            {
+                this.multi_set_h_scale(value, cx);
+            }
+        })
+        .detach();
+        self.multi_h_scale = Some(h_scale);
+
         // Гарнитура группы выбирается пикером шрифтов; пока не выбирали,
         // значения нет — как в Acrobat.
         self.multi_family = None;
@@ -2024,6 +2081,95 @@ impl Viewer {
             }));
         }
         edits
+    }
+
+    /// Правка типографики группы: разрядка, масштаб, отбивка, интерлиньяж.
+    ///
+    /// Текст не трогается — каждый блок перенабирается как есть, но с новыми
+    /// полями перенабора. Именно так одно значение ложится на разные блоки.
+    fn multi_set_metrics(&mut self, apply: impl Fn(&mut BlockRewrite), cx: &mut Context<Self>) {
+        let Some(doc) = self.doc.as_ref() else {
+            return;
+        };
+        let mut edits = Vec::new();
+        for target in &self.multi {
+            let Some(block) = doc
+                .blocks
+                .get(&target.page)
+                .and_then(|blocks| blocks.iter().find(|block| block.bbox == target.bbox))
+            else {
+                continue;
+            };
+            let style = block.dominant_style();
+            let model = model_from_block(block, &style);
+            let mut edit = BlockRewrite {
+                char_spacing: None,
+                h_scale: None,
+                para_spacing: None,
+                fill: None,
+                style_id: None,
+                page_number: target.page + 1,
+                bbox: target.bbox,
+                target: Some(target.bbox),
+                spans: model.to_spans(style.clean_family()),
+                align: target.align,
+                line_height: target.line_height,
+                rotation: block.rotation,
+                create: false,
+                owner: target.owner,
+            };
+            apply(&mut edit);
+            edits.push(BlockEdit::Rewrite(edit));
+        }
+        if edits.is_empty() {
+            return;
+        }
+        if let Some(doc) = self.doc.as_ref() {
+            doc.renderer.apply_edits(edits);
+        }
+        self.multi.clear();
+        self.multi_size = None;
+        self.multi_family = None;
+        self.multi_color = None;
+        cx.notify();
+    }
+
+    pub(crate) fn multi_set_char_spacing(&mut self, value: f32, cx: &mut Context<Self>) {
+        self.multi_set_metrics(|edit| edit.char_spacing = Some(value), cx);
+    }
+
+    pub(crate) fn multi_set_h_scale(&mut self, value: f32, cx: &mut Context<Self>) {
+        if value > 1.0 {
+            self.multi_set_metrics(|edit| edit.h_scale = Some(value), cx);
+        }
+    }
+
+    pub(crate) fn multi_set_para_spacing(&mut self, value: f32, cx: &mut Context<Self>) {
+        self.multi_set_metrics(|edit| edit.para_spacing = Some(value), cx);
+    }
+
+    /// Интерлиньяж группы задаётся множителем кегля: у блоков разные кегли,
+    /// и одно значение в пунктах имело бы смысл лишь для одного из них.
+    pub(crate) fn multi_set_leading_factor(&mut self, factor: f32, cx: &mut Context<Self>) {
+        let sizes: std::collections::HashMap<(u32, String), f32> = self
+            .multi
+            .iter()
+            .map(|target| {
+                (
+                    (target.page, format!("{:?}", target.bbox)),
+                    target.size.max(1.0),
+                )
+            })
+            .collect();
+        self.multi_set_metrics(
+            move |edit| {
+                let key = (edit.page_number - 1, format!("{:?}", edit.bbox));
+                if let Some(size) = sizes.get(&key) {
+                    edit.line_height = Some(size * factor);
+                }
+            },
+            cx,
+        );
     }
 
     /// Применяет правку стиля ко всем блокам группы.
@@ -4900,12 +5046,18 @@ impl Viewer {
     }
 
     /// Применяет готовое значение из списка пресетов.
-    fn apply_preset(&mut self, kind: PresetKind, value: f32, cx: &mut Context<Self>) {
+    fn apply_preset(
+        &mut self,
+        kind: PresetKind,
+        target: PresetTarget,
+        value: f32,
+        cx: &mut Context<Self>,
+    ) {
         self.preset_menu = None;
-        match kind {
-            PresetKind::CharSpacing => self.set_char_spacing(value, cx),
-            PresetKind::HScale => self.set_h_scale(value, cx),
-            PresetKind::LineHeight => {
+        match (target, kind) {
+            (PresetTarget::Editor, PresetKind::CharSpacing) => self.set_char_spacing(value, cx),
+            (PresetTarget::Editor, PresetKind::HScale) => self.set_h_scale(value, cx),
+            (PresetTarget::Editor, PresetKind::LineHeight) => {
                 // Пресеты интерлиньяжа — множители кегля, как в настольных
                 // редакторах: 1.2 значит «120 % кегля».
                 let size = self
@@ -4921,6 +5073,13 @@ impl Viewer {
                     .unwrap_or(12.0);
                 self.set_line_height(size * value, cx);
             }
+            (PresetTarget::Multi, PresetKind::CharSpacing) => {
+                self.multi_set_char_spacing(value, cx)
+            }
+            (PresetTarget::Multi, PresetKind::HScale) => self.multi_set_h_scale(value, cx),
+            (PresetTarget::Multi, PresetKind::LineHeight) => {
+                self.multi_set_leading_factor(value, cx)
+            }
         }
         cx.notify();
     }
@@ -4934,6 +5093,7 @@ impl Viewer {
     ) -> Option<AnyElement> {
         let menu = self.preset_menu.as_ref()?;
         let kind = menu.kind;
+        let target = menu.target;
         let values: &[f32] = match kind {
             PresetKind::CharSpacing => &[
                 -1.0, -0.75, -0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 2.0,
@@ -4974,7 +5134,7 @@ impl Viewer {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                            this.apply_preset(kind, value, cx);
+                            this.apply_preset(kind, target, value, cx);
                             cx.stop_propagation();
                         }),
                     )
@@ -5528,10 +5688,19 @@ impl Viewer {
         cx: &mut Context<Self>,
         change: impl FnOnce(&mut pdfcore::StyleDef),
     ) {
-        let Some(window) = self.styles_window.as_ref() else {
-            return;
-        };
-        let Some(mut def) = window.defs.iter().find(|d| d.id == id).cloned() else {
+        // Каталог из документа: правка стиля доступна и из панели свойств,
+        // когда окно стилей закрыто.
+        let def = self
+            .styles_window
+            .as_ref()
+            .and_then(|window| window.defs.iter().find(|d| d.id == id))
+            .or_else(|| {
+                self.doc
+                    .as_ref()
+                    .and_then(|doc| doc.styles.iter().find(|d| d.id == id))
+            })
+            .cloned();
+        let Some(mut def) = def else {
             return;
         };
         change(&mut def);
