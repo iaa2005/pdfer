@@ -2612,7 +2612,11 @@ impl Viewer {
                 .as_ref()
                 .map(|font| font.base_font.clone())
                 .unwrap_or_else(|| selection.style.clean_family().to_owned());
-            pdfcore::fonts::family_key(&family) == pdfcore::fonts::family_key(&original)
+            // Точное начертание из пикера — смена шрифта, даже когда семейство
+            // то же самое: блок «MyriadPro-Semibold» и выбранный «Myriad Pro
+            // Light» дают одинаковый ключ, но это разные шрифты.
+            self.chosen_face.is_none()
+                && pdfcore::fonts::family_key(&family) == pdfcore::fonts::family_key(&original)
         };
         if !selection.creating
             && selection.char_spacing_override.is_none()
@@ -2683,6 +2687,7 @@ impl Viewer {
             .map(|font| font.base_font.clone())
             .unwrap_or_else(|| selection.style.clean_family().to_owned());
         if selection.creating
+            || self.chosen_face.is_some()
             || pdfcore::fonts::family_key(&family) != pdfcore::fonts::family_key(&original_family)
         {
             for span in &mut edit.spans {
@@ -4867,6 +4872,7 @@ impl Viewer {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let picker = self.font_picker.as_ref()?;
+        let height = (f32::from(viewport.height) - 160.0).max(240.0);
         let query = picker.query.read(cx).value().trim().to_lowercase();
         let expanded = picker.expanded.clone();
         let scroll = picker.scroll.clone();
@@ -4883,87 +4889,132 @@ impl Viewer {
         let muted = cx.theme().muted_foreground;
         let hover = cx.theme().accent;
 
+        // Список виртуализирован: в системе сотни семейств, и каждое рисуется
+        // собственной гарнитурой. Разложить их все разом — значит грузить и
+        // шейпить сотни шрифтов на каждый кадр: прокрутка захлёбывалась.
+        // Начертания запрашиваются тоже только у видимых семейств — обход
+        // всего индекса на каждое семейство стоил дороже самой отрисовки.
+        const ROW_H: f32 = 28.0;
+        let opened: Vec<(String, Vec<pdfcore::FaceInfo>)> = families
+            .iter()
+            .filter(|family| expanded.contains(*family))
+            .map(|family| (family.clone(), fonts.faces_of(family)))
+            .collect();
+        let row_count: usize =
+            families.len() + opened.iter().map(|(_, faces)| faces.len()).sum::<usize>();
+
+        let offset = -f32::from(scroll.offset().y);
+        let list_height = {
+            let measured = f32::from(scroll.bounds().size.height);
+            // Пока список не разложен ни разу, его высота нулевая — берём
+            // высоту карточки, чтобы первый кадр не остался пустым.
+            if measured > 1.0 { measured } else { height }
+        };
+        let first_row = ((offset / ROW_H).floor() as usize).saturating_sub(4);
+        let visible_rows = (list_height / ROW_H).ceil() as usize + 8;
+        let last_row = (first_row + visible_rows).min(row_count);
+
         let mut rows: Vec<AnyElement> = Vec::new();
-        for (index, family) in families.into_iter().enumerate() {
-            let faces = fonts.faces_of(&family);
-            let open = expanded.contains(&family);
-            let family_for_toggle = family.clone();
-            let family_for_pick = family.clone();
+        let mut flat = 0usize;
+        for (index, family) in families.iter().enumerate() {
+            let open = expanded.contains(family);
+            let faces: &[pdfcore::FaceInfo] = if open {
+                opened
+                    .iter()
+                    .find(|(name, _)| name == family)
+                    .map(|(_, faces)| faces.as_slice())
+                    .unwrap_or(&[])
+            } else {
+                &[]
+            };
 
-            rows.push(
-                h_flex()
-                    .id(("font-family", index))
-                    .w_full()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .hover(|el| el.bg(hover))
-                    // Стрелка раскрывает начертания, не выбирая семейства.
-                    .child(
-                        div()
-                            .id(("font-expand", index))
-                            .w(px(18.0))
-                            .h(px(18.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_sm()
-                            .text_xs()
-                            .text_color(muted)
-                            .hover(|el| el.bg(border))
-                            .child(if open { "▾" } else { "▸" })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                    if let Some(picker) = this.font_picker.as_mut() {
-                                        if !picker.expanded.remove(&family_for_toggle) {
-                                            picker.expanded.insert(family_for_toggle.clone());
+            // Ряд семейства.
+            if (first_row..last_row).contains(&flat) {
+                let family_for_toggle = family.clone();
+                let family_for_pick = family.clone();
+                let face_count = if open {
+                    faces.len()
+                } else {
+                    fonts.faces_of(family).len()
+                };
+                rows.push(
+                    h_flex()
+                        .id(("font-family", index))
+                        .w_full()
+                        .h(px(ROW_H))
+                        .flex_none()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|el| el.bg(hover))
+                        // Стрелка раскрывает начертания, не выбирая семейства.
+                        .child(
+                            div()
+                                .id(("font-expand", index))
+                                .w(px(18.0))
+                                .h(px(18.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_sm()
+                                .text_xs()
+                                .text_color(muted)
+                                .hover(|el| el.bg(border))
+                                .child(if open { "▾" } else { "▸" })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                        if let Some(picker) = this.font_picker.as_mut() {
+                                            if !picker.expanded.remove(&family_for_toggle) {
+                                                picker.expanded.insert(family_for_toggle.clone());
+                                            }
+                                            cx.notify();
                                         }
-                                        cx.notify();
-                                    }
-                                    cx.stop_propagation();
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_sm()
-                            .truncate()
-                            .font_family(gpui::SharedString::from(family.clone()))
-                            .child(family.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format!("{}", faces.len())),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                            this.pick_font(family_for_pick.clone(), None, cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .into_any_element(),
-            );
+                                        cx.stop_propagation();
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_sm()
+                                .truncate()
+                                .font_family(gpui::SharedString::from(family.clone()))
+                                .child(family.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(format!("{face_count}")),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                this.pick_font(family_for_pick.clone(), None, cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .into_any_element(),
+                );
+            }
+            flat += 1;
 
-            if open {
-                for (face_ix, face) in faces.into_iter().enumerate() {
+            for (face_ix, face) in faces.iter().enumerate() {
+                if (first_row..last_row).contains(&flat) {
                     let family_for_face = family.clone();
                     let shown_face = face.clone();
                     rows.push(
                         h_flex()
                             .id(("font-face", index * 100 + face_ix))
                             .w_full()
+                            .h(px(ROW_H))
+                            .flex_none()
                             .items_center()
                             .pl(px(30.0))
                             .pr_2()
-                            .py_1()
                             .rounded_md()
                             .cursor_pointer()
                             .hover(|el| el.bg(hover))
@@ -4995,13 +5046,21 @@ impl Viewer {
                             .into_any_element(),
                     );
                 }
+                flat += 1;
+            }
+
+            if flat >= last_row {
+                break;
             }
         }
 
+        // Распорки восстанавливают полную длину списка: полоса прокрутки
+        // обязана знать про невидимые ряды.
+        let above = px(first_row.min(row_count) as f32 * ROW_H);
+        let below = px(row_count.saturating_sub(last_row) as f32 * ROW_H);
+
         // Карточка стоит у правой панели — там живут обе кнопки выбора.
         let width = px(340.0);
-        let height = (f32::from(viewport.height) - 160.0).max(240.0);
-        let _ = viewport;
         Some(
             div()
                 .absolute()
@@ -5047,7 +5106,9 @@ impl Viewer {
                                 .p_1()
                                 .track_scroll(&scroll)
                                 .overflow_y_scroll()
-                                .children(rows),
+                                .child(div().h(above).flex_none())
+                                .children(rows)
+                                .child(div().h(below).flex_none()),
                         ),
                 )
                 .into_any_element(),
