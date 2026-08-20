@@ -134,12 +134,15 @@ pub(crate) struct PresetMenu {
 }
 
 /// Кому пикер выбирает шрифт.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum FontTarget {
     /// Правимому блоку — панель свойств одиночного выделения.
     Editor,
     /// Группе блоков.
     Multi,
+    /// Шрифту документа, которого нет в системе: выбранная гарнитура станет
+    /// его заменой. Имя — как оно записано в PDF.
+    Substitute(String),
 }
 
 /// Раскрывающийся список шрифтов — как в издательских пакетах: семейства с
@@ -227,8 +230,6 @@ pub(crate) struct FontsWindow {
     pub fonts: Vec<pdfcore::DocumentFont>,
     /// Обход ещё идёт.
     pub loading: bool,
-    /// Шрифт, для которого открыт список замен.
-    pub replacing: Option<String>,
 }
 
 /// Меню панели миниатюр: по странице либо по разделителю-вставке.
@@ -4239,7 +4240,6 @@ impl Viewer {
     fn render_fonts_window(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let window = self.fonts_window.as_ref()?;
         let loading = window.loading;
-        let replacing = window.replacing.clone();
         let fonts = window.fonts.clone();
         let muted = cx.theme().muted_foreground;
         let warn = gpui_component::amber_500();
@@ -4360,11 +4360,14 @@ impl Viewer {
                             .small()
                             .ghost()
                             .label("Заменить")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(window) = this.fonts_window.as_mut() {
-                                    window.replacing = Some(for_menu.clone());
-                                }
-                                cx.notify();
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                // Тот же список, что и в панели свойств:
+                                // семейства с начертаниями внутри и поиском.
+                                this.toggle_font_picker(
+                                    FontTarget::Substitute(for_menu.clone()),
+                                    window,
+                                    cx,
+                                );
                             })),
                     )
                     .child(
@@ -4380,63 +4383,6 @@ impl Viewer {
 
         // Список системных гарнитур для замены. Он показывается вместо описи:
         // так его видно целиком, а не в остатке высоты под длинным списком.
-        let picker: Option<AnyElement> = replacing.clone().map(|target| {
-            let families = pdfcore::system_fonts().families();
-            let title = target.clone();
-            v_flex()
-                .id("font-picker")
-                .flex_1()
-                .min_h(px(0.0))
-                .overflow_y_scroll()
-                .child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .justify_between()
-                        .px_3()
-                        .py_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(format!("Чем набирать «{title}»")),
-                        )
-                        .child(
-                            Button::new("picker-back")
-                                .small()
-                                .ghost()
-                                .label("Назад")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(window) = this.fonts_window.as_mut() {
-                                        window.replacing = None;
-                                    }
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .children(families.into_iter().map(|family| {
-                    let target = target.clone();
-                    let shown = gpui::SharedString::from(family.clone());
-                    div()
-                        .id(gpui::SharedString::from(format!("pick-{family}")))
-                        .px_3()
-                        .py_1()
-                        .text_sm()
-                        .font_family(shown.clone())
-                        .cursor_pointer()
-                        .hover(|el| el.bg(cx.theme().accent))
-                        .child(family.clone())
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                this.substitute_font(&target, family.clone(), cx);
-                                cx.stop_propagation();
-                            }),
-                        )
-                }))
-                .into_any_element()
-        });
-
         Some(
             // Затемнение позади окна: щелчок мимо закрывает.
             div()
@@ -4505,37 +4451,34 @@ impl Viewer {
                                         ),
                                 ),
                         )
-                        .when(replacing.is_none(), |el| {
-                            el.child(
-                                v_flex()
-                                    .id("fonts-list")
-                                    .flex_1()
-                                    .min_h(px(0.0))
-                                    .overflow_y_scroll()
-                                    .when(loading, |el| {
-                                        el.child(
-                                            div()
-                                                .px_3()
-                                                .py_3()
-                                                .text_sm()
-                                                .text_color(muted)
-                                                .child("Читаю шрифты документа…"),
-                                        )
-                                    })
-                                    .when(!loading && rows.is_empty(), |el| {
-                                        el.child(
-                                            div()
-                                                .px_3()
-                                                .py_3()
-                                                .text_sm()
-                                                .text_color(muted)
-                                                .child("В документе нет текстовых шрифтов"),
-                                        )
-                                    })
-                                    .children(rows),
-                            )
-                        })
-                        .children(picker),
+                        .child(
+                            v_flex()
+                                .id("fonts-list")
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .overflow_y_scroll()
+                                .when(loading, |el| {
+                                    el.child(
+                                        div()
+                                            .px_3()
+                                            .py_3()
+                                            .text_sm()
+                                            .text_color(muted)
+                                            .child("Читаю шрифты документа…"),
+                                    )
+                                })
+                                .when(!loading && rows.is_empty(), |el| {
+                                    el.child(
+                                        div()
+                                            .px_3()
+                                            .py_3()
+                                            .text_sm()
+                                            .text_color(muted)
+                                            .child("В документе нет текстовых шрифтов"),
+                                    )
+                                })
+                                .children(rows),
+                        ),
                 )
                 .into_any_element(),
         )
@@ -5212,6 +5155,7 @@ impl Viewer {
             .as_ref()
             .is_some_and(|picker| picker.target == target)
         {
+            // Повторное нажатие той же кнопки закрывает список.
             self.font_picker = None;
             cx.notify();
             return;
@@ -5238,7 +5182,7 @@ impl Viewer {
         cx: &mut Context<Self>,
     ) {
         let target = match self.font_picker.as_ref() {
-            Some(picker) => picker.target,
+            Some(picker) => picker.target.clone(),
             None => return,
         };
         self.font_picker = None;
@@ -5271,6 +5215,11 @@ impl Viewer {
                 }
                 self.request_preview(cx);
             }
+            FontTarget::Substitute(document_font) => {
+                // Начертание в замене не участвует: подменяется гарнитура
+                // целиком, а начертание каждый кусок несёт своё.
+                self.substitute_font(&document_font, family, cx);
+            }
             FontTarget::Multi => {
                 self.multi_family = Some(family.clone());
                 let face_style = face.clone();
@@ -5297,6 +5246,9 @@ impl Viewer {
     ) -> Option<AnyElement> {
         let picker = self.font_picker.as_ref()?;
         let height = (f32::from(viewport.height) - 160.0).max(240.0);
+        // Для подмены карточка встаёт по центру: окно «Шрифты» само по
+        // центру, и список у правого края улетал бы от него.
+        let centred = matches!(picker.target, FontTarget::Substitute(_));
         let query = picker.query.read(cx).value().trim().to_lowercase();
         let expanded = picker.expanded.clone();
         let scroll = picker.scroll.clone();
@@ -5446,10 +5398,17 @@ impl Viewer {
                                 .items_center()
                                 .justify_center()
                                 .rounded_sm()
-                                .text_xs()
-                                .text_color(muted)
                                 .hover(|el| el.bg(border))
-                                .child(if open { "▾" } else { "▸" })
+                                .child(
+                                    gpui_component::Icon::empty()
+                                        .path(if open {
+                                            "icons/arrow-down-01.svg"
+                                        } else {
+                                            "icons/arrow-right-01.svg"
+                                        })
+                                        .size_4()
+                                        .text_color(cx.theme().foreground),
+                                )
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _: &MouseDownEvent, _, cx| {
@@ -5500,7 +5459,9 @@ impl Viewer {
                             .h(px(ROW_H))
                             .flex_none()
                             .items_center()
-                            .pl(px(30.0))
+                            // Отступ вдвое больше стрелки: начертания читаются
+                            // как вложенный список, а не как соседние строки.
+                            .pl(px(48.0))
                             .pr_2()
                             .rounded_md()
                             .cursor_pointer()
@@ -5565,7 +5526,10 @@ impl Viewer {
                     v_flex()
                         .absolute()
                         .top(px(96.0))
-                        .right(px(crate::properties::PANEL_WIDTH + 12.0))
+                        .when(centred, |el| el.left(gpui::relative(0.5)).ml(px(-170.0)))
+                        .when(!centred, |el| {
+                            el.right(px(crate::properties::PANEL_WIDTH + 12.0))
+                        })
                         .w(width)
                         .h(px(height))
                         .rounded_lg()
@@ -5829,7 +5793,6 @@ impl Viewer {
         self.fonts_window = Some(FontsWindow {
             fonts: Vec::new(),
             loading: true,
-            replacing: None,
         });
         if let Some(doc) = self.doc.as_ref() {
             doc.renderer.request_fonts();
@@ -5846,7 +5809,6 @@ impl Viewer {
         pdfcore::fonts::refresh();
         if let Some(window) = self.fonts_window.as_mut() {
             window.loading = true;
-            window.replacing = None;
         }
         if let Some(doc) = self.doc.as_ref() {
             doc.renderer.request_fonts();
@@ -5863,9 +5825,6 @@ impl Viewer {
     ) {
         let key = pdfcore::fonts::family_key(document_font);
         self.font_substitutes.insert(key, family.clone());
-        if let Some(window) = self.fonts_window.as_mut() {
-            window.replacing = None;
-        }
         self.set_status(
             format!("«{document_font}» будет набираться шрифтом {family}"),
             cx,

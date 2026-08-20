@@ -34,11 +34,14 @@ impl Viewer {
         target: crate::viewer::FontTarget,
         cx: &mut gpui::Context<Self>,
     ) -> impl IntoElement {
-        let (family, face) = match target {
+        let (family, face) = match &target {
             crate::viewer::FontTarget::Editor => {
                 (self.chosen_family.clone(), self.chosen_face.clone())
             }
             crate::viewer::FontTarget::Multi => (self.multi_family.clone(), None),
+            // Кнопкой выбора подмена не пользуется — у неё своя, в окне
+            // «Шрифты».
+            crate::viewer::FontTarget::Substitute(name) => (Some(name.clone()), None),
         };
         let shown = family.clone().unwrap_or_else(|| "Гарнитура…".to_owned());
         let title = match &face {
@@ -75,12 +78,17 @@ impl Viewer {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("▾"),
+                    .child(
+                        gpui_component::Icon::empty()
+                            .path("icons/arrow-down-01.svg")
+                            .size_4()
+                            .text_color(cx.theme().foreground),
+                    ),
             )
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(move |this, _: &gpui::MouseDownEvent, window, cx| {
-                    this.toggle_font_picker(target, window, cx);
+                    this.toggle_font_picker(target.clone(), window, cx);
                     cx.stop_propagation();
                 }),
             )
@@ -249,18 +257,24 @@ impl Viewer {
                     .child(
                         h_flex()
                             .gap_1()
-                            .child(style_toggle(cx, "prop-bold", "Ж", at_caret.bold, {
+                            .child(style_toggle(cx, "prop-bold", Face::Bold, at_caret.bold, {
                                 let value = !at_caret.bold;
                                 move |this, cx| this.set_bold(value, cx)
                             }))
-                            .child(style_toggle(cx, "prop-italic", "К", at_caret.italic, {
-                                let value = !at_caret.italic;
-                                move |this, cx| this.set_italic(value, cx)
-                            }))
+                            .child(style_toggle(
+                                cx,
+                                "prop-italic",
+                                Face::Italic,
+                                at_caret.italic,
+                                {
+                                    let value = !at_caret.italic;
+                                    move |this, cx| this.set_italic(value, cx)
+                                },
+                            ))
                             .child(style_toggle(
                                 cx,
                                 "prop-underline",
-                                "Ч",
+                                Face::Underline,
                                 at_caret.underline,
                                 {
                                     let value = !at_caret.underline;
@@ -270,7 +284,7 @@ impl Viewer {
                             .child(style_toggle(
                                 cx,
                                 "prop-super",
-                                "x²",
+                                Face::Superscript,
                                 at_caret.script == Script::Superscript,
                                 {
                                     let value = toggled(at_caret.script, Script::Superscript);
@@ -280,7 +294,7 @@ impl Viewer {
                             .child(style_toggle(
                                 cx,
                                 "prop-sub",
-                                "x₂",
+                                Face::Subscript,
                                 at_caret.script == Script::Subscript,
                                 {
                                     let value = toggled(at_caret.script, Script::Subscript);
@@ -304,7 +318,7 @@ impl Viewer {
                     .children(self.widgets.as_ref().map(|widgets| {
                         preset_field(
                             "Гор. масштаб, %",
-                            "icons/text-horizontal-scale.svg",
+                            "icons/arrow-data-transfer-horizontal.svg",
                             &widgets.geometry.h_scale,
                             crate::viewer::PresetKind::HScale,
                             crate::viewer::PresetTarget::Editor,
@@ -406,7 +420,7 @@ impl Viewer {
                             .gap_2()
                             .child(
                                 gpui_component::Icon::empty()
-                                    .path("icons/line-spacing.svg")
+                                    .path("icons/arrow-data-transfer-vertical.svg")
                                     .size_4()
                                     .text_color(muted),
                             )
@@ -415,7 +429,6 @@ impl Viewer {
                                 "leading-presets",
                                 crate::viewer::PresetKind::LineHeight,
                                 crate::viewer::PresetTarget::Editor,
-                                muted,
                                 cx,
                             ))
                             .child(
@@ -532,7 +545,7 @@ impl Viewer {
             .children(self.multi_h_scale.clone().map(|input| {
                 preset_field(
                     "Гор. масштаб, %",
-                    "icons/text-horizontal-scale.svg",
+                    "icons/arrow-data-transfer-horizontal.svg",
                     &input,
                     crate::viewer::PresetKind::HScale,
                     crate::viewer::PresetTarget::Multi,
@@ -552,32 +565,26 @@ impl Viewer {
                     .gap_2()
                     .child(
                         gpui_component::Icon::empty()
-                            .path("icons/line-spacing.svg")
+                            .path("icons/arrow-data-transfer-vertical.svg")
                             .size_4()
                             .text_color(muted),
                     )
                     .child(label("Интерлиньяж, × кегля", muted))
-                    .child(preset_arrow(
-                        "multi-leading-presets",
-                        crate::viewer::PresetKind::LineHeight,
-                        crate::viewer::PresetTarget::Multi,
-                        muted,
-                        cx,
-                    )),
+                    .child(preset_arrow("multi-leading-presets", crate::viewer::PresetKind::LineHeight, crate::viewer::PresetTarget::Multi, cx)),
             )
             .child(
                 h_flex()
                     .gap_1()
-                    .child(style_toggle(cx, "multi-bold", "Ж", false, |this, cx| {
+                    .child(style_toggle(cx, "multi-bold", Face::Bold, false, |this, cx| {
                         this.multi_restyle(|style| style.bold = true, cx)
                     }))
-                    .child(style_toggle(cx, "multi-italic", "К", false, |this, cx| {
+                    .child(style_toggle(cx, "multi-italic", Face::Italic, false, |this, cx| {
                         this.multi_restyle(|style| style.italic = true, cx)
                     }))
                     .child(style_toggle(
                         cx,
                         "multi-underline",
-                        "Ч",
+                        Face::Underline,
                         false,
                         |this, cx| this.multi_restyle(|style| style.underline = true, cx),
                     )),
@@ -615,7 +622,7 @@ impl Viewer {
                             .small()
                             .when(shared_align == Some(value), |b| b.primary())
                             .when(shared_align != Some(value), |b| b.ghost())
-                            .label(align_glyph(value))
+                            .icon(gpui_component::Icon::empty().path(align_icon(value)))
                             .tooltip(align_label(value))
                             .on_click(
                                 cx.listener(move |this, _, _, cx| this.multi_set_align(value, cx)),
@@ -800,14 +807,14 @@ impl Viewer {
                             .child(style_toggle(
                                 cx,
                                 "style-bold",
-                                "Ж",
+                                Face::Bold,
                                 bold,
                                 move |this, cx| this.change_style(id, cx, |def| def.bold = !bold),
                             ))
                             .child(style_toggle(
                                 cx,
                                 "style-italic",
-                                "К",
+                                Face::Italic,
                                 italic,
                                 move |this, cx| {
                                     this.change_style(id, cx, |def| def.italic = !italic)
@@ -816,7 +823,7 @@ impl Viewer {
                             .child(style_toggle(
                                 cx,
                                 "style-underline",
-                                "Ч",
+                                Face::Underline,
                                 underline,
                                 move |this, cx| {
                                     this.change_style(id, cx, |def| def.underline = !underline)
@@ -875,8 +882,12 @@ fn preset_field(
     muted: Hsla,
     cx: &mut gpui::Context<Viewer>,
 ) -> Div {
+    // Ширина — вся панель, высота — по содержимому. `flex_1` здесь означал
+    // бы «растянуться по вертикали»: в панели группы поля разъезжались,
+    // деля между собой всё свободное место.
     v_flex()
-        .flex_1()
+        .w_full()
+        .flex_none()
         .gap_0p5()
         .child(
             h_flex()
@@ -895,7 +906,7 @@ fn preset_field(
                 .items_center()
                 .gap_0p5()
                 .child(div().flex_1().child(Input::new(state).small()))
-                .child(preset_arrow(title, kind, target, muted, cx)),
+                .child(preset_arrow(title, kind, target, cx)),
         )
 }
 
@@ -904,7 +915,6 @@ fn preset_arrow(
     id: &'static str,
     kind: crate::viewer::PresetKind,
     target: crate::viewer::PresetTarget,
-    muted: Hsla,
     cx: &mut gpui::Context<Viewer>,
 ) -> gpui::Stateful<Div> {
     div()
@@ -915,11 +925,14 @@ fn preset_arrow(
         .items_center()
         .justify_center()
         .rounded_sm()
-        .text_xs()
-        .text_color(muted)
         .cursor_pointer()
         .hover(|el| el.bg(cx.theme().accent))
-        .child("▾")
+        .child(
+            gpui_component::Icon::empty()
+                .path("icons/arrow-down-01.svg")
+                .size_4()
+                .text_color(cx.theme().foreground),
+        )
         .on_mouse_down(
             gpui::MouseButton::Left,
             cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
@@ -936,13 +949,17 @@ fn preset_arrow(
         )
 }
 
+/// Поле с подписью: высота по содержимому, ширина по месту. Ширину между
+/// соседями делит [`pair`] — растягивать поле самому нельзя, в вертикальной
+/// панели это растянуло бы его по высоте.
 fn input_field(
     title: &'static str,
     state: &gpui::Entity<gpui_component::input::InputState>,
     muted: Hsla,
 ) -> Div {
     v_flex()
-        .flex_1()
+        .w_full()
+        .flex_none()
         .gap_0p5()
         .child(label(title, muted))
         .child(Input::new(state).small())
@@ -972,7 +989,12 @@ fn divider(color: Hsla) -> Div {
 }
 
 fn pair(left: Div, right: Div) -> Div {
-    h_flex().gap_3().child(left).child(right)
+    // Половина ширины каждому: `flex_1` здесь горизонтальный, потому что
+    // родитель — строка.
+    h_flex()
+        .gap_3()
+        .child(div().flex_1().child(left))
+        .child(div().flex_1().child(right))
 }
 
 /// Строка «подпись — значение» для сведений, которые только читают.
@@ -982,15 +1004,6 @@ fn row(name: &'static str, value: String, color: Hsla) -> Div {
         .gap_2()
         .child(label(name, color))
         .child(div().text_xs().child(value))
-}
-
-fn align_glyph(align: Align) -> &'static str {
-    match align {
-        Align::Left => "\u{2261}L",
-        Align::Center => "\u{2261}C",
-        Align::Right => "\u{2261}R",
-        Align::Justify => "\u{2261}J",
-    }
 }
 
 /// Повторное нажатие на кнопку индекса возвращает текст на базовую линию.
@@ -1016,10 +1029,13 @@ fn describe_color(color: Hsla) -> String {
     format!("{:.2} {:.2} {:.2}", rgba.r, rgba.g, rgba.b)
 }
 
+/// Переключатель оформления: иконка вместо буквы, название — подсказкой.
+/// Буквы «Ж», «К», «Ч» читаются только по-русски и в ряд с иконками
+/// выглядели чужеродно.
 fn style_toggle(
     cx: &mut Context<Viewer>,
     id: &'static str,
-    text: &'static str,
+    face: Face,
     active: bool,
     action: impl Fn(&mut Viewer, &mut Context<Viewer>) + 'static,
 ) -> Button {
@@ -1027,6 +1043,39 @@ fn style_toggle(
         .small()
         .when(active, |b| b.primary())
         .when(!active, |b| b.ghost())
-        .label(text)
+        .icon(gpui_component::Icon::empty().path(face.icon()))
+        .tooltip(face.title())
         .on_click(cx.listener(move |this, _, _, cx| action(this, cx)))
+}
+
+/// Начертания и индексы, которые переключает панель.
+#[derive(Clone, Copy)]
+enum Face {
+    Bold,
+    Italic,
+    Underline,
+    Superscript,
+    Subscript,
+}
+
+impl Face {
+    fn icon(self) -> &'static str {
+        match self {
+            Face::Bold => "icons/text-bold.svg",
+            Face::Italic => "icons/text-italic.svg",
+            Face::Underline => "icons/text-underline.svg",
+            Face::Superscript => "icons/text-superscript.svg",
+            Face::Subscript => "icons/text-subscript.svg",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Face::Bold => "Полужирный",
+            Face::Italic => "Курсив",
+            Face::Underline => "Подчёркнутый",
+            Face::Superscript => "Верхний индекс",
+            Face::Subscript => "Нижний индекс",
+        }
+    }
 }
