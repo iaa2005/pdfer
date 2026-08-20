@@ -1257,10 +1257,24 @@ fn spans_from_block(block: &Block, def: &crate::StyleDef) -> Vec<crate::stream_e
             }
         }
         for run in &line.runs {
+            // Стиль без гарнитуры одевает блок его же шрифтом: «Ж» в стиле
+            // обязана дать полужирный, а не остаться пожеланием. Просить
+            // шрифт при этом нужно только там, где начертание правда
+            // меняется, — иначе каждый кусок тащил бы за собой встраивание.
+            let face_changed = def.bold != run.style.is_bold() || def.italic != run.style.italic;
             let font = def
                 .family
                 .as_ref()
-                .map(|family| crate::fonts::FontRequest::new(family, def.bold, def.italic));
+                .map(|family| crate::fonts::FontRequest::new(family, def.bold, def.italic))
+                .or_else(|| {
+                    face_changed.then(|| {
+                        crate::fonts::FontRequest::new(
+                            run.style.clean_family(),
+                            def.bold,
+                            def.italic,
+                        )
+                    })
+                });
             let colour = def.color.or_else(|| {
                 let c = run.style.color;
                 Some([

@@ -53,6 +53,10 @@ pub(crate) struct Selection {
     /// содержимое или только двигали рамку.
     pub original_text: String,
     pub lines: usize,
+    /// Метка стиля, с которой блок пришёл со страницы. Сравнивается с
+    /// текущей: привязка и отвязка стиля — это правка документа, даже когда
+    /// текст и оформление остались прежними.
+    pub seeded_style_id: Option<i64>,
     /// Строки блока как они стоят на странице: текст, настоящая ширина и
     /// кегль. Эталон для выбора между шрифтами-тёзками при приёме метрик.
     pub sample_lines: Vec<(String, f32, f32)>,
@@ -552,6 +556,7 @@ pub struct Viewer {
     /// пока не введено значение, — у блоков группы они могут различаться.
     pub(crate) multi_char_spacing: Option<Entity<InputState>>,
     pub(crate) multi_h_scale: Option<Entity<InputState>>,
+    pub(crate) multi_para_spacing: Option<Entity<InputState>>,
     /// Гарнитура для всей группы: выбор в списке перенабирает каждый блок.
     /// Гарнитура, выбранная для группы. Пустая, пока не выбирали, — как в
     /// Acrobat: без общего значения показывать нечего.
@@ -660,6 +665,7 @@ impl Viewer {
             multi_size: None,
             multi_char_spacing: None,
             multi_h_scale: None,
+            multi_para_spacing: None,
             multi_family: None,
             multi_color: None,
             page_origins: HashMap::new(),
@@ -1125,6 +1131,7 @@ impl Viewer {
             para_spacing_override: None,
             fill: None,
             style_id: block.style,
+            seeded_style_id: block.style,
             creating: false,
             // Угол приходит из метки блока: повёрнутый ранее абзац открывается
             // с тем же углом, а не с нулём, — иначе первое же «применить»
@@ -1674,6 +1681,7 @@ impl Viewer {
             style: style.clone(),
             original_text: String::new(),
             lines: 1,
+            seeded_style_id: None,
             sample_lines: Vec::new(),
             align: Align::Left,
             line_height: None,
@@ -1881,6 +1889,22 @@ impl Viewer {
         })
         .detach();
         self.multi_h_scale = Some(h_scale);
+
+        let para_spacing = cx.new(|cx| InputState::new(window, cx));
+        cx.subscribe(&para_spacing, |this, state, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur)
+                && let Ok(value) = state
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .replace(',', ".")
+                    .parse::<f32>()
+            {
+                this.multi_set_para_spacing(value, cx);
+            }
+        })
+        .detach();
+        self.multi_para_spacing = Some(para_spacing);
 
         // Гарнитура группы выбирается пикером шрифтов; пока не выбирали,
         // значения нет — как в Acrobat.
@@ -2873,6 +2897,7 @@ impl Viewer {
                 && pdfcore::fonts::family_key(&family) == pdfcore::fonts::family_key(&original)
         };
         if !selection.creating
+            && selection.style_id == selection.seeded_style_id
             && selection.char_spacing_override.is_none()
             && selection.h_scale_override.is_none()
             && selection.para_spacing_override.is_none()
@@ -5737,11 +5762,19 @@ impl Viewer {
 
     /// Привязывает выделенный блок к стилю и применяет спек к его тексту.
     pub(crate) fn bind_style_to_selection(&mut self, id: i64, cx: &mut Context<Self>) {
-        let Some(def) = self
+        // Каталог берётся из документа: привязать стиль можно и из панели
+        // свойств, когда окно «Стили» закрыто.
+        let def = self
             .styles_window
             .as_ref()
-            .and_then(|w| w.defs.iter().find(|d| d.id == id).cloned())
-        else {
+            .and_then(|w| w.defs.iter().find(|d| d.id == id))
+            .or_else(|| {
+                self.doc
+                    .as_ref()
+                    .and_then(|doc| doc.styles.iter().find(|d| d.id == id))
+            })
+            .cloned();
+        let Some(def) = def else {
             return;
         };
         let Some(selection) = self.selected.as_mut() else {
@@ -5775,6 +5808,20 @@ impl Viewer {
         // документе, и незакоммиченная правка для него невидима.
         self.apply_edit(cx);
         self.set_status(format!("Блок привязан к стилю «{}»", def.name), cx);
+    }
+
+    /// Снимает со блока метку стиля: текст остаётся как есть, каскад его
+    /// больше не трогает.
+    pub(crate) fn unbind_style(&mut self, cx: &mut Context<Self>) {
+        let Some(selection) = self.selected.as_mut() else {
+            return;
+        };
+        if selection.style_id.take().is_none() {
+            return;
+        }
+        selection.touched = true;
+        self.apply_edit(cx);
+        self.set_status("Стиль отвязан — текст остался как был", cx);
     }
 
     /// Открывает окно «Шрифты» и просит опись у движка.

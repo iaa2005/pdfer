@@ -540,6 +540,12 @@ impl Viewer {
                     cx,
                 )
             }))
+            .children(self.multi_para_spacing.clone().map(|input| {
+                v_flex()
+                    .gap_0p5()
+                    .child(label("Отбивка абзацев, пт", muted))
+                    .child(Input::new(&input).small())
+            }))
             .child(
                 h_flex()
                     .items_center()
@@ -701,91 +707,158 @@ fn align_icon(align: Align) -> &'static str {
 
 /// Подписанное числовое поле панели.
 impl Viewer {
-    /// Секция «Стиль» панели свойств: имя, начертание и кегль стиля блока.
-    /// Любая правка тут же перенабирает все блоки стиля.
+    /// Секция «Стиль» панели свойств.
+    ///
+    /// У блока со стилем — имя, оформление и переключатели начертания:
+    /// каждая правка каскадом перенабирает все блоки этого стиля. У блока без
+    /// стиля — список стилей документа, чтобы привязать его, не открывая
+    /// отдельного окна.
     fn render_style_section(&self, muted: Hsla, cx: &mut gpui::Context<Self>) -> Option<Div> {
-        let style_id = self.selected.as_ref()?.style_id?;
-        let def = self
-            .doc
-            .as_ref()?
-            .styles
-            .iter()
-            .find(|def| def.id == style_id)?
-            .clone();
-        let id = def.id;
-        let (bold, italic, underline) = (def.bold, def.italic, def.underline);
-        let shown_family = def
-            .family
-            .clone()
-            .unwrap_or_else(|| "Гарнитура блока".into());
-        let size_text = def
-            .size
-            .map(|size| format!("{size:.1} пт"))
-            .unwrap_or_else(|| "кегль блока".into());
+        let selection = self.selected.as_ref()?;
+        let catalog = self.doc.as_ref().map(|doc| doc.styles.clone())?;
+        let bound = selection
+            .style_id
+            .and_then(|id| catalog.iter().find(|def| def.id == id))
+            .cloned();
+
+        // Ни стиля у блока, ни стилей в документе — секции не место.
+        if bound.is_none() && catalog.is_empty() {
+            return None;
+        }
+
+        let header = h_flex()
+            .items_center()
+            .gap_2()
+            .child(heading("СТИЛЬ", muted))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("style-open-window")
+                    .text_xs()
+                    .text_color(muted)
+                    .cursor_pointer()
+                    .hover(|el| el.text_color(cx.theme().foreground))
+                    .child("Все стили…")
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
+                            this.open_styles(cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+            );
+
+        let body = match bound {
+            Some(def) => {
+                let id = def.id;
+                let (bold, italic, underline) = (def.bold, def.italic, def.underline);
+                // Пустые поля стиля значат «оставить как у блока»; писать
+                // это дважды незачем — панель узкая.
+                let spec = match (def.family.clone(), def.size) {
+                    (None, None) => "гарнитура и кегль блока".to_owned(),
+                    (Some(family), None) => family,
+                    (None, Some(size)) => format!("{size:.1} пт"),
+                    (Some(family), Some(size)) => format!("{family} · {size:.1} пт"),
+                };
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_sm().truncate().child(def.name.clone()))
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .id("style-unbind")
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .cursor_pointer()
+                                    .hover(|el| el.text_color(cx.theme().foreground))
+                                    .child("отвязать")
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
+                                            this.unbind_style(cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .truncate()
+                                    .child(spec),
+                            )
+                            .child(style_toggle(
+                                cx,
+                                "style-bold",
+                                "Ж",
+                                bold,
+                                move |this, cx| this.change_style(id, cx, |def| def.bold = !bold),
+                            ))
+                            .child(style_toggle(
+                                cx,
+                                "style-italic",
+                                "К",
+                                italic,
+                                move |this, cx| {
+                                    this.change_style(id, cx, |def| def.italic = !italic)
+                                },
+                            ))
+                            .child(style_toggle(
+                                cx,
+                                "style-underline",
+                                "Ч",
+                                underline,
+                                move |this, cx| {
+                                    this.change_style(id, cx, |def| def.underline = !underline)
+                                },
+                            )),
+                    )
+            }
+            None => {
+                v_flex()
+                    .gap_1()
+                    .child(label("Блок без стиля — привязать:", muted))
+                    .child(h_flex().gap_1().flex_wrap().children(
+                        catalog.into_iter().enumerate().map(|(index, def)| {
+                            let id = def.id;
+                            div()
+                                .id(("style-bind", index))
+                                .px_2()
+                                .py_0p5()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .text_xs()
+                                .cursor_pointer()
+                                .hover(|el| el.bg(cx.theme().accent))
+                                .child(def.name.clone())
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
+                                        this.bind_style_to_selection(id, cx);
+                                        cx.stop_propagation();
+                                    }),
+                                )
+                        }),
+                    ))
+            }
+        };
 
         Some(
             v_flex()
                 .gap_1()
-                .child(heading("СТИЛЬ", muted))
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .child(div().text_sm().child(def.name.clone()))
-                        .child(div().flex_1())
-                        .child(
-                            div()
-                                .id("style-open-window")
-                                .text_xs()
-                                .text_color(muted)
-                                .cursor_pointer()
-                                .hover(|el| el.text_color(cx.theme().foreground))
-                                .child("Все стили…")
-                                .on_mouse_down(
-                                    gpui::MouseButton::Left,
-                                    cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
-                                        this.open_styles(cx);
-                                        cx.stop_propagation();
-                                    }),
-                                ),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_xs()
-                                .text_color(muted)
-                                .truncate()
-                                .child(format!("{shown_family} · {size_text}")),
-                        )
-                        .child(style_toggle(
-                            cx,
-                            "style-bold",
-                            "Ж",
-                            bold,
-                            move |this, cx| this.change_style(id, cx, |def| def.bold = !bold),
-                        ))
-                        .child(style_toggle(
-                            cx,
-                            "style-italic",
-                            "К",
-                            italic,
-                            move |this, cx| this.change_style(id, cx, |def| def.italic = !italic),
-                        ))
-                        .child(style_toggle(
-                            cx,
-                            "style-underline",
-                            "Ч",
-                            underline,
-                            move |this, cx| {
-                                this.change_style(id, cx, |def| def.underline = !underline)
-                            },
-                        )),
-                )
+                .child(header)
+                .child(body)
                 .child(divider(cx.theme().border)),
         )
     }
