@@ -53,6 +53,9 @@ pub(crate) struct Selection {
     /// содержимое или только двигали рамку.
     pub original_text: String,
     pub lines: usize,
+    /// Строки блока как они стоят на странице: текст, настоящая ширина и
+    /// кегль. Эталон для выбора между шрифтами-тёзками при приёме метрик.
+    pub sample_lines: Vec<(String, f32, f32)>,
     pub align: Align,
     /// Выключку или интерлиньяж меняли вручную, значит абзац придётся
     /// перенабрать, даже если сам текст остался прежним.
@@ -545,6 +548,9 @@ pub struct Viewer {
     /// Гарнитура, выбранная в списке для правимого блока. `None` — гарнитура
     /// блока не менялась.
     pub(crate) chosen_family: Option<String>,
+    /// Последние выбранные гарнитуры, свежие впереди. Показываются шапкой
+    /// пикера: за правку одной книги шрифты гоняют по кругу.
+    recent_fonts: Vec<String>,
     /// Точное начертание, если его выбрали в раскрытом семействе.
     pub(crate) chosen_face: Option<String>,
     /// Правимому абзацу нужно отдать клавиатуру на ближайшей отрисовке.
@@ -612,6 +618,7 @@ impl Viewer {
             rubber: None,
             font_picker: None,
             chosen_family: None,
+            recent_fonts: Vec::new(),
             chosen_face: None,
             tool: Tool::default(),
             multi: Vec::new(),
@@ -1056,6 +1063,11 @@ impl Viewer {
             style: style.clone(),
             original_text: block.text(),
             lines: block.lines.len(),
+            sample_lines: block
+                .lines
+                .iter()
+                .map(|line| (line.text(), line.bbox.width(), line.dominant_size()))
+                .collect(),
             align: block.align,
             needs_retypeset: false,
             line_height: block.leading(),
@@ -1243,13 +1255,68 @@ impl Viewer {
             let color = font
                 .color
                 .map(|[r, g, b]| gpui::Rgba { r, g, b, a: 1.0 }.into());
-            let (size, primary) = (font.size, font.metrics.clone());
-            // Метрики раздаются по ключу гарнитуры: кусок ищет свой шрифт
-            // тем же ключом при обмере (см. `metrics_for_run`).
-            let by_family: std::collections::HashMap<_, _> = metrics
-                .into_iter()
-                .map(|(name, encoder)| (pdfcore::fonts::family_key(&name), encoder))
-                .collect();
+            let (size, mut primary) = (font.size, font.metrics.clone());
+
+            // Средняя ошибка энкодера на строках блока, как они стоят на
+            // странице. Эталон — настоящие ширины строк от pdfium.
+            let sample = self
+                .selected
+                .as_ref()
+                .map(|selection| selection.sample_lines.clone())
+                .unwrap_or_default();
+            let error_of = |encoder: &pdfcore::stream_edit::Encoder| -> f32 {
+                let mut total = 0.0;
+                let mut real_total = 0.0;
+                for (text, real, line_size) in &sample {
+                    if *real <= 1.0 {
+                        continue;
+                    }
+                    total += (encoder.width(text, *line_size) - real).abs();
+                    real_total += real;
+                }
+                if real_total <= 0.0 {
+                    0.0
+                } else {
+                    total / real_total
+                }
+            };
+
+            // Метрики раздаются по ключу гарнитуры: кусок ищет свой шрифт тем
+            // же ключом при обмере (см. `metrics_for_run`). У ключа может
+            // оказаться несколько претендентов — в ресурсах страницы часто
+            // живут тёзки вроде «PT Serif Bold Italic» и «PTSerif-BoldItalic»,
+            // и у одного из них ширины кириллицы взяты с потолка. Побеждает
+            // тот, кто точнее меряет настоящие строки блока: раньше побеждал
+            // последний по порядку, и поле правки переносило слова не так,
+            // как страница.
+            let mut by_family: std::collections::HashMap<String, pdfcore::stream_edit::Encoder> =
+                std::collections::HashMap::new();
+            for (name, encoder) in metrics {
+                let key = pdfcore::fonts::family_key(&name);
+                match by_family.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(encoder);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        if error_of(&encoder) < error_of(slot.get()) {
+                            slot.insert(encoder);
+                        }
+                    }
+                }
+            }
+            // Запасной энкодер блока сверяется с тем же эталоном: ему меряют
+            // куски без своей гарнитуры, и врать ему так же нельзя.
+            if let Some(current) = primary.as_ref() {
+                let best = by_family
+                    .values()
+                    .min_by(|a, b| error_of(a).total_cmp(&error_of(b)));
+                if let Some(best) = best
+                    && !sample.is_empty()
+                    && error_of(best) + 0.005 < error_of(current)
+                {
+                    primary = Some(best.clone());
+                }
+            }
             widgets.editor.update(cx, |editor, cx| {
                 if let Some(color) = color {
                     editor.base.color = color;
@@ -1556,6 +1623,7 @@ impl Viewer {
             style: style.clone(),
             original_text: String::new(),
             lines: 1,
+            sample_lines: Vec::new(),
             align: Align::Left,
             line_height: None,
             page_font: None,
@@ -2690,8 +2758,16 @@ impl Viewer {
             || self.chosen_face.is_some()
             || pdfcore::fonts::family_key(&family) != pdfcore::fonts::family_key(&original_family)
         {
-            for span in &mut edit.spans {
-                if span.font.is_none() {
+            // Спаны и раны модели идут один в один. Гарнитура панели
+            // накрывает каждый кусок, где гарнитуру не выбирали для него
+            // отдельно, — включая куски, у которых шрифт уже стоит из-за
+            // смены начертания: тот шрифт построен от документной гарнитуры,
+            // и оставить его — значит молча потерять выбор. Так и терялся
+            // «CMU Serif · Bold» на курсивном блоке: сброс курсива помечал
+            // кусок сменившим начертание раньше, чем семейство успевало
+            // примениться.
+            for (span, run) in edit.spans.iter_mut().zip(model.runs()) {
+                if run.style.family.is_none() {
                     // Начертание куска сохраняется: жирное начало абзаца
                     // остаётся жирным и в новой гарнитуре.
                     let mut request = pdfcore::FontRequest::new(&family, span.bold, span.italic);
@@ -2726,8 +2802,11 @@ impl Viewer {
             None
         };
         if let Some(chosen) = manual.or(auto) {
-            for span in &mut edit.spans {
-                if span.font.is_none() {
+            for (span, run) in edit.spans.iter_mut().zip(model.runs()) {
+                // Куски, где гарнитуру выбрали отдельно, не трогаем; куски со
+                // сменённым начертанием несут шрифт документной гарнитуры —
+                // той самой, которой нет, — и подменяются вместе с прочими.
+                if run.style.family.is_none() {
                     span.font = Some(pdfcore::FontRequest::new(&chosen, span.bold, span.italic));
                     span.page_family = None;
                 }
@@ -4822,6 +4901,10 @@ impl Viewer {
             None => return,
         };
         self.font_picker = None;
+        // Выбранное всплывает в шапку недавних; больше четырёх не держим.
+        self.recent_fonts.retain(|name| name != &family);
+        self.recent_fonts.insert(0, family.clone());
+        self.recent_fonts.truncate(4);
         match target {
             FontTarget::Editor => {
                 self.chosen_family = Some(family.clone());
@@ -4903,7 +4986,14 @@ impl Viewer {
         let row_count: usize =
             families.len() + opened.iter().map(|(_, faces)| faces.len()).sum::<usize>();
 
-        let offset = -f32::from(scroll.offset().y);
+        // Шапка недавних прокручивается вместе со списком и сдвигает его
+        // начало вниз; расчёт видимых рядов ведётся от места после неё.
+        let header_px = if query.is_empty() && !self.recent_fonts.is_empty() {
+            self.recent_fonts.len() as f32 * ROW_H + 9.0
+        } else {
+            0.0
+        };
+        let offset = (-f32::from(scroll.offset().y) - header_px).max(0.0);
         let list_height = {
             let measured = f32::from(scroll.bounds().size.height);
             // Пока список не разложен ни разу, его высота нулевая — берём
@@ -4915,6 +5005,62 @@ impl Viewer {
         let last_row = (first_row + visible_rows).min(row_count);
 
         let mut rows: Vec<AnyElement> = Vec::new();
+
+        // Шапка недавних: три-четыре последних выбора и разделитель. Только
+        // без поиска — запрос сужает список, и дубли сверху лишь мешали бы.
+        if query.is_empty() && !self.recent_fonts.is_empty() {
+            let recents: Vec<String> = self
+                .recent_fonts
+                .iter()
+                .filter(|name| fonts.has_family(name))
+                .cloned()
+                .collect();
+            for (index, family) in recents.iter().enumerate() {
+                let family_for_pick = family.clone();
+                rows.push(
+                    h_flex()
+                        .id(("font-recent", index))
+                        .w_full()
+                        .h(px(ROW_H))
+                        .flex_none()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|el| el.bg(hover))
+                        .child(div().w(px(18.0)).flex_none())
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_sm()
+                                .truncate()
+                                .font_family(gpui::SharedString::from(family.clone()))
+                                .child(family.clone()),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                this.pick_font(family_for_pick.clone(), None, cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .into_any_element(),
+                );
+            }
+            if !recents.is_empty() {
+                rows.push(
+                    div()
+                        .w_full()
+                        .h(px(1.0))
+                        .flex_none()
+                        .my_1()
+                        .bg(border)
+                        .into_any_element(),
+                );
+            }
+        }
+
         let mut flat = 0usize;
         for (index, family) in families.iter().enumerate() {
             let open = expanded.contains(family);

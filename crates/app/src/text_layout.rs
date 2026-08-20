@@ -353,7 +353,10 @@ fn wrap(pieces: &[Piece], wrap_width: f32, line_height: f32) -> Vec<LaidLine> {
     for (index, piece) in pieces.iter().enumerate() {
         // Пробел в конце строки не переносится: иначе он уезжал бы вниз и
         // следующая строка начиналась бы с отступа.
-        if x + piece.width > wrap_width && !placed.is_empty() && !piece.blank {
+        // Полпроцента запаса: строки книги свёрстаны впритык к рамке, и
+        // без него слово, стоящее ровно по краю, падало бы на новую строку
+        // от одной ошибки округления.
+        if x + piece.width > wrap_width * 1.005 && !placed.is_empty() && !piece.blank {
             close(&mut placed, &mut lines, &mut top);
             x = 0.0;
         }
