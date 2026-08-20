@@ -291,8 +291,22 @@ impl Viewer {
                     .children(self.widgets.as_ref().map(|widgets| {
                         let g = &widgets.geometry;
                         pair(
-                            input_field("Межбуквенный, пт", &g.char_spacing, muted),
-                            input_field("Гор. масштаб, %", &g.h_scale, muted),
+                            preset_field(
+                                "Межбуквенный, пт",
+                                "icons/text-tracking.svg",
+                                &g.char_spacing,
+                                crate::viewer::PresetKind::CharSpacing,
+                                muted,
+                                cx,
+                            ),
+                            preset_field(
+                                "Гор. масштаб, %",
+                                "icons/text-horizontal-scale.svg",
+                                &g.h_scale,
+                                crate::viewer::PresetKind::HScale,
+                                muted,
+                                cx,
+                            ),
                         )
                     }))
                     .child(label("Цвет", muted))
@@ -387,7 +401,19 @@ impl Viewer {
                         h_flex()
                             .items_center()
                             .gap_2()
+                            .child(
+                                gpui_component::Icon::empty()
+                                    .path("icons/line-spacing.svg")
+                                    .size_4()
+                                    .text_color(muted),
+                            )
                             .child(label("Интерлиньяж", muted))
+                            .child(preset_arrow(
+                                "leading-presets",
+                                crate::viewer::PresetKind::LineHeight,
+                                muted,
+                                cx,
+                            ))
                             .child(
                                 Button::new("leading-minus")
                                     .small()
@@ -622,6 +648,75 @@ fn align_icon(align: Align) -> &'static str {
 }
 
 /// Подписанное числовое поле панели.
+/// Числовое поле с иконкой и списком готовых значений: подпись, само поле и
+/// стрелка, раскрывающая пресеты, — как в настольных редакторах.
+fn preset_field(
+    title: &'static str,
+    icon: &'static str,
+    state: &gpui::Entity<gpui_component::input::InputState>,
+    kind: crate::viewer::PresetKind,
+    muted: Hsla,
+    cx: &mut gpui::Context<Viewer>,
+) -> Div {
+    v_flex()
+        .flex_1()
+        .gap_0p5()
+        .child(
+            h_flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    gpui_component::Icon::empty()
+                        .path(icon)
+                        .size_3p5()
+                        .text_color(muted),
+                )
+                .child(label(title, muted)),
+        )
+        .child(
+            h_flex()
+                .items_center()
+                .gap_0p5()
+                .child(div().flex_1().child(Input::new(state).small()))
+                .child(preset_arrow(title, kind, muted, cx)),
+        )
+}
+
+/// Стрелка, раскрывающая список готовых значений у поля.
+fn preset_arrow(
+    id: &'static str,
+    kind: crate::viewer::PresetKind,
+    muted: Hsla,
+    cx: &mut gpui::Context<Viewer>,
+) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .w(px(18.0))
+        .h(px(22.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .text_xs()
+        .text_color(muted)
+        .cursor_pointer()
+        .hover(|el| el.bg(cx.theme().accent))
+        .child("▾")
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                // Меню встаёт под стрелкой; точная ширина не важна — рендер
+                // прижмёт его к краю окна, если не влезет.
+                this.preset_menu = Some(crate::viewer::PresetMenu {
+                    kind,
+                    at: gpui::point(event.position.x - px(70.0), event.position.y + px(14.0)),
+                });
+                cx.stop_propagation();
+                cx.notify();
+            }),
+        )
+}
+
 fn input_field(
     title: &'static str,
     state: &gpui::Entity<gpui_component::input::InputState>,

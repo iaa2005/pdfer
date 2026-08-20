@@ -43,6 +43,11 @@ pub struct BaseStyle {
     /// Выключка абзаца. Строки поля правки ложатся так же, как на странице:
     /// центрованный заголовок и в поле стоит по центру, а не прижат влево.
     pub align: pdfcore::model::Align,
+    /// Разрядка Tc в пунктах — прибавка после каждого знака. Блоки с ней
+    /// нередки, и без учёта поле правки мерило строки уже, чем страница.
+    pub char_spacing: f32,
+    /// Горизонтальный масштаб Tz в процентах; 100 — без искажения.
+    pub h_scale: f32,
 }
 
 /// Слово или промежуток между словами, уже обмеренные.
@@ -275,15 +280,23 @@ fn measure_pieces(text: &RichText, base: &BaseStyle) -> Vec<Piece> {
     let mut pieces = Vec::new();
     let mut offset = 0;
 
+    // Так же меряет и запись в файл: разрядка после каждого знака, затем всё
+    // умножается на горизонтальный масштаб (см. `Runs::width`).
+    let h_scale = if base.h_scale > 1.0 {
+        base.h_scale / 100.0
+    } else {
+        1.0
+    };
     for run in text.runs() {
         let size = effective_size(&run.style, base);
         let metrics = metrics_for_run(&run.style, base);
         for token in tokenize(&run.text) {
             let slice = &run.text[token.start..token.end];
+            let spacing = base.char_spacing * slice.chars().count() as f32;
             pieces.push(Piece {
                 text: slice.to_owned(),
                 range: offset + token.start..offset + token.end,
-                width: measure_with(metrics, slice, size),
+                width: (measure_with(metrics, slice, size) + spacing) * h_scale,
                 size,
                 blank: slice.chars().all(char::is_whitespace),
             });
@@ -432,6 +445,8 @@ mod tests {
     fn base(scale: f32) -> BaseStyle {
         BaseStyle {
             align: pdfcore::model::Align::Left,
+            char_spacing: 0.0,
+            h_scale: 100.0,
             metrics_by_family: std::collections::HashMap::new(),
             size_points: 10.0,
             line_height_points: 12.0,

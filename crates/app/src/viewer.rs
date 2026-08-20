@@ -104,6 +104,23 @@ pub(crate) enum Tool {
 
 /// Пункт списка гарнитур: имя, написанное этой же гарнитурой.
 ///
+/// Какому свойству показать список готовых значений.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PresetKind {
+    /// Межбуквенное расстояние, пункты.
+    CharSpacing,
+    /// Горизонтальный масштаб, проценты.
+    HScale,
+    /// Интерлиньяж — множители кегля.
+    LineHeight,
+}
+
+/// Раскрытый список готовых значений: у какого поля и где на экране.
+pub(crate) struct PresetMenu {
+    pub kind: PresetKind,
+    pub at: Point<Pixels>,
+}
+
 /// Кому пикер выбирает шрифт.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FontTarget {
@@ -545,6 +562,8 @@ pub struct Viewer {
     pub(crate) tool: Tool,
     /// Открытый список выбора шрифта.
     pub(crate) font_picker: Option<FontPickerUi>,
+    /// Открытый список готовых значений у числового поля панели.
+    pub(crate) preset_menu: Option<PresetMenu>,
     /// Гарнитура, выбранная в списке для правимого блока. `None` — гарнитура
     /// блока не менялась.
     pub(crate) chosen_family: Option<String>,
@@ -617,6 +636,7 @@ impl Viewer {
             pending_press: None,
             rubber: None,
             font_picker: None,
+            preset_menu: None,
             chosen_family: None,
             recent_fonts: Vec::new(),
             chosen_face: None,
@@ -1318,6 +1338,7 @@ impl Viewer {
                     primary = Some(best.clone());
                 }
             }
+            let (char_spacing, h_scale) = (font.char_spacing, font.h_scale);
             widgets.editor.update(cx, |editor, cx| {
                 if let Some(color) = color {
                     editor.base.color = color;
@@ -1325,6 +1346,10 @@ impl Viewer {
                 editor.base.size_points = size;
                 editor.base.metrics = primary;
                 editor.base.metrics_by_family = by_family;
+                // Раскладка поля меряет с той же разрядкой и тем же
+                // масштабом, что и страница.
+                editor.base.char_spacing = char_spacing;
+                editor.base.h_scale = h_scale;
                 cx.notify();
             });
         }
@@ -2286,6 +2311,12 @@ impl Viewer {
         if let Some(selection) = self.selected.as_mut() {
             selection.char_spacing_override = Some(value);
             selection.touched = true;
+            if let Some(widgets) = self.widgets.as_ref() {
+                widgets.editor.update(cx, |editor, cx| {
+                    editor.base.char_spacing = value;
+                    cx.notify();
+                });
+            }
             self.request_preview(cx);
         }
     }
@@ -2296,6 +2327,12 @@ impl Viewer {
         {
             selection.h_scale_override = Some(value);
             selection.touched = true;
+            if let Some(widgets) = self.widgets.as_ref() {
+                widgets.editor.update(cx, |editor, cx| {
+                    editor.base.h_scale = value;
+                    cx.notify();
+                });
+            }
             self.request_preview(cx);
         }
     }
@@ -4862,6 +4899,122 @@ impl Viewer {
         cx.notify();
     }
 
+    /// Применяет готовое значение из списка пресетов.
+    fn apply_preset(&mut self, kind: PresetKind, value: f32, cx: &mut Context<Self>) {
+        self.preset_menu = None;
+        match kind {
+            PresetKind::CharSpacing => self.set_char_spacing(value, cx),
+            PresetKind::HScale => self.set_h_scale(value, cx),
+            PresetKind::LineHeight => {
+                // Пресеты интерлиньяжа — множители кегля, как в настольных
+                // редакторах: 1.2 значит «120 % кегля».
+                let size = self
+                    .selected
+                    .as_ref()
+                    .map(|selection| {
+                        selection
+                            .page_font
+                            .as_ref()
+                            .map(|font| font.size)
+                            .unwrap_or(selection.style.size)
+                    })
+                    .unwrap_or(12.0);
+                self.set_line_height(size * value, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Список готовых значений у числового поля: поле остаётся полем — сюда
+    /// выносятся типовые значения, чтобы не набирать их руками.
+    fn render_preset_menu(
+        &mut self,
+        viewport: gpui::Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let menu = self.preset_menu.as_ref()?;
+        let kind = menu.kind;
+        let values: &[f32] = match kind {
+            PresetKind::CharSpacing => &[
+                -1.0, -0.75, -0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 2.0,
+            ],
+            PresetKind::HScale => &[80.0, 85.0, 90.0, 95.0, 100.0, 105.0, 110.0, 115.0, 120.0],
+            PresetKind::LineHeight => &[1.0, 1.2, 1.4, 1.5, 2.0, 2.5, 3.0],
+        };
+        let shown = |value: f32| -> String {
+            match kind {
+                PresetKind::CharSpacing => format!("{value:.2}"),
+                PresetKind::HScale => format!("{value:.0}"),
+                PresetKind::LineHeight => format!("{value:.2}"),
+            }
+        };
+
+        let height = values.len() as f32 * 26.0 + 10.0;
+        let left = menu.at.x.min(viewport.width - px(96.0)).max(px(0.0));
+        let top = menu
+            .at
+            .y
+            .min(viewport.height - px(height) - px(8.0))
+            .max(px(0.0));
+
+        let rows: Vec<AnyElement> = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let value = *value;
+                div()
+                    .id(("preset", index))
+                    .px_2()
+                    .py_0p5()
+                    .rounded_sm()
+                    .text_sm()
+                    .cursor_pointer()
+                    .hover(|el| el.bg(cx.theme().accent))
+                    .child(shown(value))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            this.apply_preset(kind, value, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.preset_menu = None;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    v_flex()
+                        .absolute()
+                        .left(left)
+                        .top(top)
+                        .w(px(88.0))
+                        .p_1()
+                        .gap_0p5()
+                        .rounded_md()
+                        .bg(cx.theme().popover)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .shadow_lg()
+                        .occlude()
+                        .children(rows),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// Открывает и закрывает список выбора шрифта.
     pub(crate) fn toggle_font_picker(
         &mut self,
@@ -6564,6 +6717,7 @@ impl Render for Viewer {
         let properties = self.render_properties(cx);
         let panel_menu = self.render_panel_menu(window.viewport_size(), cx);
         let font_picker = self.render_font_picker(window.viewport_size(), cx);
+        let preset_menu = self.render_preset_menu(window.viewport_size(), cx);
         let fonts_window = self.render_fonts_window(cx);
         let styles_window = self.render_styles_window(cx);
 
@@ -6588,6 +6742,7 @@ impl Render for Viewer {
             .children(styles_window)
             .children(panel_menu)
             .children(font_picker)
+            .children(preset_menu)
     }
 }
 
@@ -6705,6 +6860,8 @@ fn build_widgets(
     let base = BaseStyle {
         metrics_by_family: std::collections::HashMap::new(),
         align,
+        char_spacing: 0.0,
+        h_scale: 100.0,
         size_points: size,
         line_height_points: line_height,
         // Рамка лежит поверх страницы, отрисованной с этим масштабом, — значит
