@@ -3320,6 +3320,66 @@ mod tests {
         );
     }
 
+    /// Кириллица в блоке, набранном латинским шрифтом без неё.
+    ///
+    /// Пользователь переключает раскладку и печатает — редактор обязан
+    /// отказать словами, а не свалиться.
+    #[test]
+    fn cyrillic_in_a_latin_only_font_fails_gracefully() {
+        let (mut doc, bbox) = page_with_text_in_form();
+        let result = rewrite_block(
+            &mut doc,
+            &BlockRewrite {
+                page_number: 1,
+                bbox,
+                target: Some(bbox),
+                spans: vec![StyledSpan::plain("Привет")],
+                align: crate::model::Align::Left,
+                line_height: None,
+                rotation: 0.0,
+                char_spacing: None,
+                h_scale: None,
+                para_spacing: None,
+                fill: None,
+                style_id: None,
+                create: false,
+                owner: None,
+            },
+        );
+        // Любой исход годится, кроме паники: либо текст лёг, либо внятный отказ.
+        if let Err(e) = result {
+            let text = format!("{e:#}");
+            assert!(!text.is_empty(), "отказ должен быть объяснён");
+        }
+    }
+
+    /// Второй заход правки по тому же блоку внутри формы.
+    ///
+    /// После первой правки в потоке формы появляется размеченный блок, и
+    /// разбор обязан справиться с ним так же, как с исходным текстом.
+    #[test]
+    fn a_form_block_survives_a_second_rewrite() {
+        let (mut doc, bbox) = page_with_text_in_form();
+        let request = |text: &str| BlockRewrite {
+            page_number: 1,
+            bbox,
+            target: Some(bbox),
+            spans: vec![StyledSpan::plain(text)],
+            align: crate::model::Align::Left,
+            line_height: None,
+            rotation: 0.0,
+            char_spacing: None,
+            h_scale: None,
+            para_spacing: None,
+            fill: None,
+            style_id: None,
+            create: false,
+            owner: None,
+        };
+        rewrite_block(&mut doc, &request("Pervaya")).expect("первая правка");
+        rewrite_block(&mut doc, &request("Vtoraya")).expect("вторая правка");
+    }
+
     /// Helvetica без /Widths мерилась «пол-кегля на знак» — и каретка с
     /// подсветкой выделения ехали мимо букв. Теперь ширины берутся из
     /// системного собрата, и узкая «i» обязана быть уже широкой «M».

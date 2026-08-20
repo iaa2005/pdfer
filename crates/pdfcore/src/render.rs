@@ -247,7 +247,13 @@ impl Renderer {
                     }));
                     if let Err(payload) = outcome {
                         let reason = panic_reason(&payload);
-                        tracing::error!("поток рендера умер: {reason}");
+                        // Стек пишется рядом с причиной: без него «index out
+                        // of bounds» ничего не говорит о том, где именно.
+                        let trace = std::backtrace::Backtrace::force_capture();
+                        tracing::error!(
+                            "поток рендера умер: {reason}
+{trace}"
+                        );
                         let _ = events_for_panic.send(RenderEvent::Failed {
                             page: None,
                             message: format!(
