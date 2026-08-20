@@ -223,8 +223,8 @@ pub struct BlockMark {
 /// потом и раскладываются по меткам.
 pub fn page_marks(document: &Document, page_number: u32) -> Result<Vec<BlockMark>> {
     let page_id = page_id(document, page_number)?;
-    let content = Content::decode(&document.get_page_content(page_id))
-        .map_err(|e| anyhow!("не удалось разобрать поток страницы: {e}"))?;
+    // Текст может лежать не в потоке страницы, а в форме, вызванной с неё.
+    let (_canvas, content) = text_canvas(document, page_id)?;
     Ok(collect_marks(&content))
 }
 
@@ -330,8 +330,8 @@ pub struct MarkVariant {
 
 pub fn mark_variants(document: &Document, page_number: u32) -> Result<Vec<MarkVariant>> {
     let page_id = page_id(document, page_number)?;
-    let content = Content::decode(&document.get_page_content(page_id))
-        .map_err(|e| anyhow!("не удалось разобрать поток страницы: {e}"))?;
+    // Текст может лежать не в потоке страницы, а в форме, вызванной с неё.
+    let (_canvas, content) = text_canvas(document, page_id)?;
 
     let shows = show_owners(&content);
     let mut owners: Vec<Option<i64>> = Vec::new();
@@ -522,8 +522,8 @@ pub struct BlockErase {
 /// та же дисциплина, что у перенабора.
 pub fn erase_block(document: &mut Document, request: &BlockErase) -> Result<usize> {
     let page_id = page_id(document, request.page_number)?;
-    let content = Content::decode(&document.get_page_content(page_id))
-        .map_err(|e| anyhow!("не удалось разобрать поток страницы: {e}"))?;
+    // Текст может лежать не в потоке страницы, а в форме, вызванной с неё.
+    let (canvas, content) = text_canvas(document, page_id)?;
 
     let hits = find_hits(&content, request.bbox, request.owner);
     if hits.is_empty() {
@@ -539,9 +539,7 @@ pub fn erase_block(document: &mut Document, request: &BlockErase) -> Result<usiz
     let encoded = Content { operations }
         .encode()
         .map_err(|e| anyhow!("не удалось собрать поток страницы: {e}"))?;
-    document
-        .change_page_content(page_id, encoded)
-        .map_err(|e| anyhow!("не удалось записать поток страницы: {e}"))?;
+    write_canvas(document, &canvas, encoded)?;
     Ok(cleared)
 }
 
@@ -598,8 +596,8 @@ pub fn transform_block(
     request: &BlockTransform,
 ) -> Result<TransformOutcome> {
     let page_id = page_id(document, request.page_number)?;
-    let content = Content::decode(&document.get_page_content(page_id))
-        .map_err(|e| anyhow!("не удалось разобрать поток страницы: {e}"))?;
+    // Текст может лежать не в потоке страницы, а в форме, вызванной с неё.
+    let (canvas, content) = text_canvas(document, page_id)?;
 
     let runs = find_runs(&content, request.bbox, request.owner);
     if runs.inside.is_empty() {
@@ -759,9 +757,7 @@ pub fn transform_block(
     let encoded = Content { operations }
         .encode()
         .map_err(|e| anyhow!("не удалось собрать поток страницы: {e}"))?;
-    document
-        .change_page_content(page_id, encoded)
-        .map_err(|e| anyhow!("не удалось записать поток страницы: {e}"))?;
+    write_canvas(document, &canvas, encoded)?;
 
     Ok(TransformOutcome { moved_runs: moved })
 }
@@ -1073,8 +1069,8 @@ const HIT_SLACK: f32 = 3.0;
 
 pub fn rewrite_block(document: &mut Document, request: &BlockRewrite) -> Result<RewriteOutcome> {
     let page_id = page_id(document, request.page_number)?;
-    let content = Content::decode(&document.get_page_content(page_id))
-        .map_err(|e| anyhow!("не удалось разобрать поток страницы: {e}"))?;
+    // Текст может лежать не в потоке страницы, а в форме, вызванной с неё.
+    let (canvas, content) = text_canvas(document, page_id)?;
 
     let hits = find_hits(&content, request.bbox, request.owner);
     if hits.is_empty() && !request.create {
@@ -1331,9 +1327,7 @@ pub fn rewrite_block(document: &mut Document, request: &BlockRewrite) -> Result<
     let encoded = Content { operations }
         .encode()
         .map_err(|e| anyhow!("не удалось собрать поток страницы: {e}"))?;
-    document
-        .change_page_content(page_id, encoded)
-        .map_err(|e| anyhow!("не удалось записать поток страницы: {e}"))?;
+    write_canvas(document, &canvas, encoded)?;
 
     Ok(RewriteOutcome {
         cleared_ops: cleared,
@@ -1460,8 +1454,8 @@ pub fn block_metrics(
     owner: Option<i64>,
 ) -> Result<Vec<(String, Encoder)>> {
     let page_id = page_id(document, page_number)?;
-    let content = Content::decode(&document.get_page_content(page_id))
-        .map_err(|e| anyhow!("не удалось разобрать поток страницы: {e}"))?;
+    // Текст может лежать не в потоке страницы, а в форме, вызванной с неё.
+    let (_canvas, content) = text_canvas(document, page_id)?;
 
     let hits = find_hits(&content, bbox, owner);
     let fonts = page_fonts(document, page_id)?;
@@ -1497,6 +1491,125 @@ pub fn block_metrics(
     Ok(result)
 }
 
+/// Поток, в котором лежит текст страницы.
+///
+/// Обычно это поток самой страницы. Но Word, 1С и генераторы отчётов кладут
+/// всё содержимое в форму (`Form XObject`) и вызывают её со страницы одним
+/// оператором `Do` — тогда в потоке страницы текста нет вовсе, и править
+/// нужно поток формы. Снаружи разницы быть не должно: холст прячет её.
+pub(crate) enum Canvas {
+    /// Текст прямо в потоке страницы.
+    Page(ObjectId),
+    /// Текст в форме, вызванной со страницы.
+    Form(ObjectId),
+}
+
+/// Есть ли в потоке хоть один показ текста.
+fn shows_text(content: &Content) -> bool {
+    content
+        .operations
+        .iter()
+        .any(|op| matches!(op.operator.as_str(), "Tj" | "TJ" | "'" | "\""))
+}
+
+/// Выбирает холст страницы и отдаёт его содержимое.
+///
+/// Сперва смотрит поток самой страницы: если текст там, ничего не меняется.
+/// Иначе обходит формы, вызванные со страницы, и берёт первую, где текст
+/// есть. Вложенность в один уровень покрывает всё, что встречается на
+/// практике: генераторы заворачивают страницу в одну форму.
+pub(crate) fn text_canvas(document: &Document, page_id: ObjectId) -> Result<(Canvas, Content)> {
+    let page_content = Content::decode(&document.get_page_content(page_id))
+        .map_err(|e| anyhow!("не удалось разобрать поток страницы: {e}"))?;
+    if shows_text(&page_content) {
+        return Ok((Canvas::Page(page_id), page_content));
+    }
+
+    for form_id in page_forms(document, page_id) {
+        let Ok(stream) = document.get_object(form_id).and_then(|o| o.as_stream()) else {
+            continue;
+        };
+        let Ok(bytes) = stream.decompressed_content() else {
+            continue;
+        };
+        let Ok(form_content) = Content::decode(&bytes) else {
+            continue;
+        };
+        if shows_text(&form_content) {
+            return Ok((Canvas::Form(form_id), form_content));
+        }
+    }
+
+    // Текста нет нигде — отдаём страницу, как было: сообщение об ошибке
+    // сформирует вызывающий, ему виднее, что именно не вышло.
+    Ok((Canvas::Page(page_id), page_content))
+}
+
+/// Формы, вызванные со страницы, в порядке появления в ресурсах.
+fn page_forms(document: &Document, page_id: ObjectId) -> Vec<ObjectId> {
+    let mut forms = Vec::new();
+    let Ok(resources) = document.get_page_resources(page_id) else {
+        return forms;
+    };
+
+    let mut collect = |dict: &Dictionary| {
+        if let Ok(Object::Dictionary(xobjects)) = dict.get(b"XObject") {
+            for (_, value) in xobjects.iter() {
+                if let Object::Reference(id) = value
+                    && document
+                        .get_object(*id)
+                        .and_then(|o| o.as_stream())
+                        .map(|stream| {
+                            stream
+                                .dict
+                                .get(b"Subtype")
+                                .and_then(|o| o.as_name())
+                                .map(|name| name == b"Form")
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false)
+                {
+                    forms.push(*id);
+                }
+            }
+        }
+    };
+
+    if let Some(dict) = resources.0 {
+        collect(dict);
+    }
+    for id in resources.1 {
+        if let Ok(dict) = document.get_object(id).and_then(|o| o.as_dict()) {
+            collect(dict);
+        }
+    }
+    forms
+}
+
+/// Записывает переписанный поток обратно в холст.
+pub(crate) fn write_canvas(
+    document: &mut Document,
+    canvas: &Canvas,
+    encoded: Vec<u8>,
+) -> Result<()> {
+    match canvas {
+        Canvas::Page(page_id) => document
+            .change_page_content(*page_id, encoded)
+            .map_err(|e| anyhow!("не удалось записать поток страницы: {e}")),
+        Canvas::Form(form_id) => {
+            let stream = document
+                .get_object_mut(*form_id)
+                .and_then(|o| o.as_stream_mut())
+                .map_err(|e| anyhow!("форма недоступна для записи: {e}"))?;
+            stream.set_plain_content(encoded);
+            // Сжатие снимается вместе с содержимым: иначе читатель развернёт
+            // старые байты по фильтру, которого больше нет.
+            stream.dict.remove(b"Filter");
+            Ok(())
+        }
+    }
+}
+
 /// Читает оформление абзаца, ничего не меняя.
 pub fn block_font(
     document: &Document,
@@ -1505,8 +1618,8 @@ pub fn block_font(
     owner: Option<i64>,
 ) -> Result<BlockFont> {
     let page_id = page_id(document, page_number)?;
-    let content = Content::decode(&document.get_page_content(page_id))
-        .map_err(|e| anyhow!("не удалось разобрать поток страницы: {e}"))?;
+    // Текст может лежать не в потоке страницы, а в форме, вызванной с неё.
+    let (_canvas, content) = text_canvas(document, page_id)?;
 
     let hits = find_hits(&content, bbox, owner);
     let first = hits
@@ -1968,6 +2081,23 @@ fn page_fonts(document: &Document, page_id: ObjectId) -> Result<HashMap<String, 
     for id in resources.1 {
         if let Ok(Object::Dictionary(dict)) = document.get_object(id) {
             collect(dict);
+        }
+    }
+
+    // Шрифты формы: когда текст живёт в ней, `/F1` объявлен в её собственных
+    // ресурсах, а не в ресурсах страницы.
+    for form_id in page_forms(document, page_id) {
+        let Ok(stream) = document.get_object(form_id).and_then(|o| o.as_stream()) else {
+            continue;
+        };
+        match stream.dict.get(b"Resources") {
+            Ok(Object::Dictionary(dict)) => collect(dict),
+            Ok(Object::Reference(id)) => {
+                if let Ok(dict) = document.get_object(*id).and_then(|o| o.as_dict()) {
+                    collect(dict);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3066,6 +3196,129 @@ fn wrap(text: &str, encoder: &Encoder, size: f32, max_width: f32) -> Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Собирает страницу, весь текст которой лежит в форме, вызванной со
+    /// страницы одним `Do`, — так делают Word, 1С и генераторы справок.
+    fn page_with_text_in_form() -> (Document, Rect) {
+        let mut doc = Document::with_version("1.7");
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let inner = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                Operation::new("Td", vec![72.into(), 700.into()]),
+                Operation::new("Tj", vec![Object::string_literal("Spravka")]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let form = doc.add_object(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+            },
+            inner.encode().expect("поток формы"),
+        ));
+        let page_content = Content {
+            operations: vec![Operation::new("Do", vec!["Fm0".into()])],
+        };
+        let contents = doc.add_object(lopdf::Stream::new(
+            dictionary! {},
+            page_content.encode().expect("поток страницы"),
+        ));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+            "Contents" => contents,
+            "Resources" => dictionary! {
+                "XObject" => dictionary! { "Fm0" => form },
+            },
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog);
+        (doc, Rect::new(70.0, 695.0, 300.0, 715.0))
+    }
+
+    /// Текст в форме читается и правится наравне с текстом страницы.
+    ///
+    /// Раньше разбор смотрел только в поток страницы, а там — один `Do`:
+    /// редактор честно отвечал «в границах блока нет текста» и отказывался
+    /// править целый класс документов.
+    #[test]
+    fn text_inside_a_form_is_found_and_rewritten() {
+        let (mut doc, bbox) = page_with_text_in_form();
+
+        let font = block_font(&doc, 1, bbox, None).expect("оформление читается");
+        assert_eq!(font.base_font, "Helvetica");
+
+        let outcome = rewrite_block(
+            &mut doc,
+            &BlockRewrite {
+                page_number: 1,
+                bbox,
+                target: Some(bbox),
+                spans: vec![StyledSpan::plain("Perepisano")],
+                align: crate::model::Align::Left,
+                line_height: None,
+                rotation: 0.0,
+                char_spacing: None,
+                h_scale: None,
+                para_spacing: None,
+                fill: None,
+                style_id: None,
+                create: false,
+                owner: None,
+            },
+        )
+        .expect("перенабор проходит");
+        assert_eq!(outcome.cleared_ops, 1, "старый показ текста снят");
+
+        // Правка легла в поток формы, а не в поток страницы: страница
+        // по-прежнему только вызывает форму.
+        let page_id = page_id(&doc, 1).expect("страница");
+        let page_bytes = doc.get_page_content(page_id);
+        let page_text = String::from_utf8_lossy(&page_bytes);
+        assert!(
+            page_text.contains("Do") && !page_text.contains("Perepisano"),
+            "страница осталась вызовом формы: {page_text}"
+        );
+
+        let form_id = page_forms(&doc, page_id)
+            .first()
+            .copied()
+            .expect("форма на месте");
+        let form_bytes = doc
+            .get_object(form_id)
+            .and_then(|o| o.as_stream())
+            .expect("форма")
+            .decompressed_content()
+            .expect("поток формы");
+        // Текст пишется шестнадцатеричной строкой — в кодировке шрифта.
+        let form_text = String::from_utf8_lossy(&form_bytes);
+        let hex: String = "Perepisano"
+            .bytes()
+            .map(|byte| format!("{byte:02X}"))
+            .collect();
+        assert!(
+            form_text.contains(&hex),
+            "новый текст записан в форму: {form_text}"
+        );
+    }
 
     /// Helvetica без /Widths мерилась «пол-кегля на знак» — и каретка с
     /// подсветкой выделения ехали мимо букв. Теперь ширины берутся из
