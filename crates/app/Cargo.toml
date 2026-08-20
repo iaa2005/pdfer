@@ -15,7 +15,7 @@ flume = "0.12.0"
 gpui = "0.2.2"
 gpui-component = "0.5.1"
 image = "0.25.10"
-pdfcore = { version = "0.0.2", path = "../pdfcore" }
+pdfcore = { version = "0.0.3", path = "../pdfcore" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tracing = "0.1.44"
