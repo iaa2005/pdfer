@@ -235,7 +235,28 @@ impl Renderer {
             .name("pdf-render".to_owned())
             .spawn({
                 let shared = Arc::clone(&shared);
-                move || worker(path, shared, events, info_tx)
+                let events_for_panic = events.clone();
+                move || {
+                    // Паника в потоке рендера — беда, но не повод молча
+                    // умереть: приложение продолжает жить, и пользователь
+                    // обязан узнать, почему правки перестали применяться.
+                    // Раньше поток тихо исчезал, а окно вело себя так, будто
+                    // ничего не происходит.
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        worker(path, shared, events, info_tx)
+                    }));
+                    if let Err(payload) = outcome {
+                        let reason = panic_reason(&payload);
+                        tracing::error!("поток рендера умер: {reason}");
+                        let _ = events_for_panic.send(RenderEvent::Failed {
+                            page: None,
+                            message: format!(
+                                "Внутренняя ошибка обработчика документа: {reason}. \
+                                 Сохраните книгу и откройте её заново."
+                            ),
+                        });
+                    }
+                }
             })
             .context("не удалось запустить поток рендера")?;
 
@@ -427,6 +448,17 @@ impl Drop for Renderer {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+/// Текст паники: сообщение, если оно строкой, иначе честное «без описания».
+fn panic_reason(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_owned()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "без описания".to_owned()
     }
 }
 

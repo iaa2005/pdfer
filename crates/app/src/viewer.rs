@@ -593,6 +593,10 @@ pub struct Viewer {
     recent_fonts: Vec<String>,
     /// Точное начертание, если его выбрали в раскрытом семействе.
     pub(crate) chosen_face: Option<String>,
+    /// Последний отказ движка. Показывается заметной полосой поверх
+    /// страницы: строку состояния внизу окна легко не заметить, и человек
+    /// решал, что правка «просто не работает».
+    pub(crate) failure: Option<String>,
     /// Правимому абзацу нужно отдать клавиатуру на ближайшей отрисовке.
     focus_editor: bool,
     /// Просьба вернуть клавиатуру самому виду: в сетке страниц горячие
@@ -658,6 +662,7 @@ impl Viewer {
             rubber: None,
             font_picker: None,
             preset_menu: None,
+            failure: None,
             chosen_family: None,
             recent_fonts: Vec::new(),
             chosen_face: None,
@@ -939,7 +944,8 @@ impl Viewer {
                 }
                 RenderEvent::Failed { page, message } => {
                     tracing::warn!(?page, "операция не удалась: {message}");
-                    doc.status = Some(message);
+                    doc.status = Some(message.clone());
+                    self.failure = Some(message);
                     Vec::new()
                 }
             }
@@ -6827,6 +6833,51 @@ impl Viewer {
             .into_any_element()
     }
 
+    /// Полоса отказа поверх страницы: что именно не вышло и как закрыть.
+    fn render_failure(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let message = self.failure.clone()?;
+        Some(
+            div()
+                .absolute()
+                .top(px(64.0))
+                .left(gpui::relative(0.5))
+                .ml(px(-260.0))
+                .w(px(520.0))
+                .occlude()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_start()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .rounded_lg()
+                        .bg(cx.theme().popover)
+                        .border_1()
+                        .border_color(gpui_component::amber_500())
+                        .shadow_lg()
+                        .child(
+                            gpui_component::Icon::empty()
+                                .path("icons/alert-02.svg")
+                                .size_4()
+                                .text_color(gpui_component::amber_500()),
+                        )
+                        .child(div().flex_1().text_sm().child(message))
+                        .child(
+                            Button::new("failure-close")
+                                .small()
+                                .ghost()
+                                .label("×")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.failure = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_status(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let border = cx.theme().border;
@@ -6893,6 +6944,7 @@ impl Render for Viewer {
         let panel_menu = self.render_panel_menu(window.viewport_size(), cx);
         let font_picker = self.render_font_picker(window.viewport_size(), cx);
         let preset_menu = self.render_preset_menu(window.viewport_size(), cx);
+        let failure = self.render_failure(cx);
         let fonts_window = self.render_fonts_window(cx);
         let styles_window = self.render_styles_window(cx);
 
@@ -6918,6 +6970,7 @@ impl Render for Viewer {
             .children(panel_menu)
             .children(font_picker)
             .children(preset_menu)
+            .children(failure)
     }
 }
 
