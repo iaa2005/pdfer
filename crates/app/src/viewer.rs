@@ -236,6 +236,9 @@ pub(crate) struct FontsWindow {
 pub(crate) enum PanelMenu {
     /// Контекстное меню страницы, позиция — в координатах окна.
     Page { page: u32, at: Point<Pixels> },
+    /// Правый клик по тексту в чтении: копирование, вставка, удаление.
+    /// Пункты гаснут по обстановке — пустой буфер, нет выделения.
+    TextOps { at: Point<Pixels> },
     /// Меню вставки после страницы: пустой лист либо целый документ.
     /// `before_first` — щель перед самой первой страницей.
     Insert {
@@ -259,6 +262,38 @@ fn press_became_drag(from: Point<Pixels>, to: Point<Pixels>) -> bool {
 }
 
 /// Снимок блока в буфере: всё, что нужно, чтобы выложить копию.
+/// Буфер скопированных блоков — один на всю программу.
+///
+/// Раньше он был полем просмотрщика и умирал при открытии другого документа:
+/// Ctrl+C в одной книге, Ctrl+V в другой — и вставлять уже нечего. Рядом с
+/// блоками хранится путь исходника: вставка в чужой документ не может
+/// полагаться на его шрифты и переводит документные стили в явные запросы.
+static BLOCK_CLIPBOARD: std::sync::Mutex<(Option<PathBuf>, Vec<CopiedBlock>)> =
+    std::sync::Mutex::new((None, Vec::new()));
+
+/// Кладёт блоки в буфер программы.
+fn clipboard_store(source: &Path, blocks: Vec<CopiedBlock>) {
+    if let Ok(mut guard) = BLOCK_CLIPBOARD.lock() {
+        *guard = (Some(source.to_path_buf()), blocks);
+    }
+}
+
+/// Забирает копию буфера и признак «скопировано в этом же документе».
+fn clipboard_take(current: &Path) -> (bool, Vec<CopiedBlock>) {
+    match BLOCK_CLIPBOARD.lock() {
+        Ok(guard) => (guard.0.as_deref() == Some(current), guard.1.clone()),
+        Err(_) => (false, Vec::new()),
+    }
+}
+
+/// Пуст ли буфер блоков.
+pub(crate) fn clipboard_is_empty() -> bool {
+    BLOCK_CLIPBOARD
+        .lock()
+        .map(|guard| guard.1.is_empty())
+        .unwrap_or(true)
+}
+
 #[derive(Clone)]
 pub(crate) struct CopiedBlock {
     pub runs: Vec<crate::rich_text::Run>,
@@ -545,7 +580,6 @@ pub struct Viewer {
     pub(crate) copied_page: Option<u32>,
     /// Буфер блоков: Ctrl+C кладёт сюда выделенный блок или группу,
     /// Ctrl+V выкладывает копии на видимую страницу.
-    block_clipboard: Vec<CopiedBlock>,
     /// Перетаскивание группы целиком: нажали на блок группы и повели.
     group_drag: Option<GroupDrag>,
     /// Нажатие, ещё не ставшее ни щелчком, ни рамкой. Разрешается на
@@ -665,7 +699,6 @@ impl Viewer {
             font_substitutes: HashMap::new(),
             panel_menu: None,
             copied_page: None,
-            block_clipboard: Vec::new(),
             group_drag: None,
             pending_press: None,
             rubber: None,
@@ -2750,7 +2783,7 @@ impl Viewer {
             return;
         }
         let count = copied.len();
-        self.block_clipboard = copied;
+        clipboard_store(&self.path, copied);
         self.set_status(
             if count == 1 {
                 "Блок скопирован — Ctrl+V вставит копию".to_owned()
@@ -2761,13 +2794,54 @@ impl Viewer {
         );
     }
 
+    /// Правый клик по блоку или по пустому месту страницы.
+    ///
+    /// Невыделенный блок сперва становится выделенным — как в проводнике:
+    /// меню всегда говорит о том, на чём его открыли. Клик по пустому месту
+    /// выделение не трогает — вставке оно не мешает, а «скопировать» и
+    /// «удалить» продолжают говорить о текущем выборе.
+    pub(crate) fn open_text_menu(
+        &mut self,
+        page: u32,
+        block: Option<usize>,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = block {
+            let already = self
+                .doc
+                .as_ref()
+                .and_then(|doc| doc.blocks.get(&page))
+                .and_then(|blocks| blocks.get(index))
+                .map(|clicked| {
+                    self.multi
+                        .iter()
+                        .any(|target| target.page == page && target.bbox == clicked.bbox)
+                })
+                .unwrap_or(false);
+            let selected_here = self
+                .selected
+                .as_ref()
+                .is_some_and(|selection| selection.page == page);
+            if !already && !selected_here {
+                self.commit_or_clear(cx);
+                self.multi.clear();
+                self.toggle_multi(page, index, window, cx);
+            }
+        }
+        self.panel_menu = Some(PanelMenu::TextOps { at });
+        cx.notify();
+    }
+
     /// Ctrl+V: копии выкладываются на видимую страницу пакетом-созданием.
     ///
     /// На той же странице копия сдвигается на 12 пт вправо-вниз — иначе она
     /// легла бы точь-в-точь на оригинал и выглядела бы как «ничего не
     /// случилось». Взаимное расположение блоков группы сохраняется.
     pub(crate) fn paste_blocks(&mut self, cx: &mut Context<Self>) {
-        if self.block_clipboard.is_empty() {
+        let (same_document, clipboard) = clipboard_take(&self.path);
+        if clipboard.is_empty() {
             return;
         }
         // Открытая правка завершается: выделенной останется только копия,
@@ -2778,21 +2852,39 @@ impl Viewer {
             return;
         };
         let page = doc.current_page;
-        let same_page = self.block_clipboard.iter().any(|b| b.page == page);
+        let same_page = same_document && clipboard.iter().any(|b| b.page == page);
         let (dx, dy) = if same_page { (12.0, -12.0) } else { (0.0, 0.0) };
 
         let mut edits = Vec::new();
         let mut pasted = Vec::new();
-        for block in &self.block_clipboard {
+        for block in &clipboard {
             let b = block.bbox;
             let target = Rect::new(b.left + dx, b.bottom + dy, b.right + dx, b.top + dy);
             pasted.push(target);
             let model = RichText::from_runs(block.runs.clone());
+            let mut spans = model.to_spans(&block.base_family);
+            // Документная гарнитура спана резолвится в ресурсах конкретной
+            // страницы. На чужой странице — даже этого же документа — такого
+            // имени может не быть, и вставка падала бы «шрифт не найден».
+            // Стили переводятся в явные запросы всюду, кроме родной страницы.
+            if !(same_document && block.page == page) {
+                for (span, run) in spans.iter_mut().zip(model.runs()) {
+                    if span.font.is_none() {
+                        let family = run
+                            .style
+                            .document_family
+                            .clone()
+                            .unwrap_or_else(|| block.base_family.clone());
+                        span.font = Some(pdfcore::FontRequest::new(family, span.bold, span.italic));
+                        span.page_family = None;
+                    }
+                }
+            }
             edits.push(BlockEdit::Rewrite(BlockRewrite {
                 page_number: page + 1,
                 bbox: target,
                 target: Some(target),
-                spans: model.to_spans(&block.base_family),
+                spans,
                 line_height: block.line_height,
                 rotation: block.rotation,
                 align: block.align,
@@ -4712,6 +4804,45 @@ impl Viewer {
                                     },
                                     cx,
                                 )
+                            }),
+                        },
+                    ],
+                )
+            }
+            PanelMenu::TextOps { at } => {
+                let has_selection = !self.multi.is_empty() || self.selected.is_some();
+                let has_clipboard = !clipboard_is_empty();
+                (
+                    *at,
+                    vec![
+                        Item {
+                            id: "menu-copy-blocks",
+                            icon: "icons/copy-01.svg",
+                            title: "Копировать".to_owned(),
+                            enabled: has_selection,
+                            danger: false,
+                            action: std::rc::Rc::new(|this, cx| this.copy_blocks(cx)),
+                        },
+                        Item {
+                            id: "menu-paste-blocks",
+                            icon: "icons/clipboard.svg",
+                            title: "Вставить".to_owned(),
+                            enabled: has_clipboard,
+                            danger: false,
+                            action: std::rc::Rc::new(|this, cx| this.paste_blocks(cx)),
+                        },
+                        Item {
+                            id: "menu-delete-blocks",
+                            icon: "icons/delete-02.svg",
+                            title: "Удалить".to_owned(),
+                            enabled: has_selection,
+                            danger: true,
+                            action: std::rc::Rc::new(|this, cx| {
+                                if this.multi.is_empty() {
+                                    this.erase_selected(cx);
+                                } else {
+                                    this.delete_multi(cx);
+                                }
                             }),
                         },
                     ],
@@ -6832,6 +6963,13 @@ impl Viewer {
                             cx.stop_propagation();
                         }),
                     )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.open_text_menu(page, Some(index), event.position, window, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
             })
             .collect();
 
@@ -6900,6 +7038,13 @@ impl Viewer {
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                             this.press_on_page(page, event.position, cx)
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.open_text_menu(page, None, event.position, window, cx);
+                            cx.stop_propagation();
                         }),
                     )
                     .border_1()
