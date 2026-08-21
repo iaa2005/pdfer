@@ -375,6 +375,11 @@ const SPREAD_GAP: f32 = 16.0;
 /// 48 МБ на тайл: пять-шесть страниц ещё умещаются в бюджет кэша разом.
 const MAX_TILE_PIXELS: f32 = 12_000_000.0;
 
+/// Насколько близко к заказанному месту должна лечь вставленная копия,
+/// чтобы считаться ею. Перенабор ставит строки по метрикам шрифта, и рамка
+/// сходится не буква в букву; но чужой блок рядом отстоит куда дальше.
+const PASTE_MATCH: f32 = 8.0;
+
 const PREFETCH_AHEAD: u32 = 4;
 const PREFETCH_BEHIND: u32 = 1;
 /// Сколько миниатюр готовится за пределами видимой части панели.
@@ -581,6 +586,10 @@ pub struct Viewer {
     page_origins_next: HashMap<u32, Vec<Point<Pixels>>>,
     /// Активный инструмент нижней панели.
     pub(crate) tool: Tool,
+    /// Куда легла вставленная копия: страница и рамки, которых ждём в свежем
+    /// разборе. Как только блоки придут, они станут выделенными — иначе
+    /// вставленное поверх чужого текста уже не выбрать мышью.
+    pending_paste: Option<(u32, Vec<Rect>)>,
     /// Открытый список выбора шрифта.
     pub(crate) font_picker: Option<FontPickerUi>,
     /// Открытый список готовых значений у числового поля панели.
@@ -660,6 +669,7 @@ impl Viewer {
             group_drag: None,
             pending_press: None,
             rubber: None,
+            pending_paste: None,
             font_picker: None,
             preset_menu: None,
             failure: None,
@@ -2760,6 +2770,10 @@ impl Viewer {
         if self.block_clipboard.is_empty() {
             return;
         }
+        // Открытая правка завершается: выделенной останется только копия,
+        // иначе панель свойств показывала бы прежний блок, а Delete унёс бы
+        // не то.
+        self.commit_or_clear(cx);
         let Some(doc) = self.doc.as_ref() else {
             return;
         };
@@ -2768,9 +2782,11 @@ impl Viewer {
         let (dx, dy) = if same_page { (12.0, -12.0) } else { (0.0, 0.0) };
 
         let mut edits = Vec::new();
+        let mut pasted = Vec::new();
         for block in &self.block_clipboard {
             let b = block.bbox;
             let target = Rect::new(b.left + dx, b.bottom + dy, b.right + dx, b.top + dy);
+            pasted.push(target);
             let model = RichText::from_runs(block.runs.clone());
             edits.push(BlockEdit::Rewrite(BlockRewrite {
                 page_number: page + 1,
@@ -2790,7 +2806,89 @@ impl Viewer {
             }));
         }
         doc.renderer.apply_edits(edits);
+        // Блоков ещё нет: страница перечитывается после правки. Запоминаем
+        // места, а выделим, когда придёт свежий разбор.
+        self.pending_paste = Some((page, pasted));
         self.set_status("Вставляю копию…", cx);
+        cx.notify();
+    }
+
+    /// Делает выделенными блоки, только что легшие вставкой.
+    ///
+    /// Рамка вставленного блока почти совпадает с заказанной, но не буква в
+    /// букву: перенабор ставит строки по метрикам шрифта. Поэтому блок
+    /// ищется по ближайшему центру, а не по точному совпадению.
+    fn select_pasted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((page, wanted)) = self.pending_paste.clone() else {
+            return;
+        };
+        // Разбор страницы после правки сбрасывается и приходит заново; его
+        // появление и есть сигнал, что вставленное уже на месте.
+        let Some(blocks) = self.doc.as_ref().and_then(|doc| doc.blocks.get(&page)) else {
+            return;
+        };
+
+        let mut found: Vec<MultiTarget> = Vec::new();
+        for rect in &wanted {
+            let centre = (
+                (rect.left + rect.right) / 2.0,
+                (rect.bottom + rect.top) / 2.0,
+            );
+            let nearest = blocks
+                .iter()
+                .filter(|block| {
+                    // Тот же блок дважды не берём: две копии рядом должны
+                    // выделиться каждая своя.
+                    !found
+                        .iter()
+                        .any(|target| target.page == page && target.bbox == block.bbox)
+                })
+                .min_by(|a, b| {
+                    let distance = |block: &pdfcore::Block| {
+                        let cx = (block.bbox.left + block.bbox.right) / 2.0 - centre.0;
+                        let cy = (block.bbox.bottom + block.bbox.top) / 2.0 - centre.1;
+                        cx * cx + cy * cy
+                    };
+                    distance(a).total_cmp(&distance(b))
+                });
+            // Разбор страницы после правки сбрасывается, но ответ на прежний
+            // запрос может прийти уже после — в нём копии ещё нет. Такой
+            // разбор узнаётся по тому, что рядом с заказанным местом ничего
+            // не легло: ждём следующего.
+            let nearest = nearest.filter(|block| {
+                let dx = (block.bbox.left + block.bbox.right) / 2.0 - centre.0;
+                let dy = (block.bbox.bottom + block.bbox.top) / 2.0 - centre.1;
+                dx * dx + dy * dy <= PASTE_MATCH * PASTE_MATCH
+            });
+            let Some(block) = nearest else {
+                return;
+            };
+            found.push(MultiTarget {
+                page,
+                bbox: block.bbox,
+                owner: block.mark,
+                size: block.dominant_style().size,
+                line_height: block.leading(),
+                align: block.align,
+            });
+        }
+
+        self.pending_paste = None;
+        if found.is_empty() {
+            return;
+        }
+        let count = found.len();
+        self.selected = None;
+        self.multi = found;
+        self.rebuild_multi_size(window, cx);
+        self.set_status(
+            if count == 1 {
+                "Копия вставлена и выделена — тяните её на место".to_owned()
+            } else {
+                format!("Вставлено блоков: {count} — выделены, тяните на место")
+            },
+            cx,
+        );
         cx.notify();
     }
 
@@ -6679,7 +6777,7 @@ impl Viewer {
         let show_blocks = doc.show_blocks;
 
         let doc = self.doc.as_mut().expect("документ проверен выше");
-        let rects: Vec<(usize, Rect)> = doc
+        let mut rects: Vec<(usize, Rect)> = doc
             .blocks
             .get(&page)
             .map(|blocks| {
@@ -6690,6 +6788,15 @@ impl Viewer {
                     .collect()
             })
             .unwrap_or_default();
+        // Выделенные блоки ловят мышь первыми: они рисуются последними и
+        // потому лежат сверху. Иначе копию, легшую поверх чужого текста, не
+        // ухватить — нажатие уходило нижнему блоку, и выделение слетало.
+        let picked = self.multi.clone();
+        rects.sort_by_key(|(_, bbox)| {
+            picked
+                .iter()
+                .any(|target| target.page == page && target.bbox == *bbox)
+        });
 
         let overlays: Vec<Div> = rects
             .into_iter()
@@ -6795,8 +6902,12 @@ impl Viewer {
                     .border_1()
                     .border_color(border)
                     .when_some(texture, |el, tex| el.child(img(tex).w(width).h(height)))
-                    .children(overlays)
+                    // Метки группы рисуются раньше рамок блоков: иначе они
+                    // накрывают их собой и глушат мышь — выделенный блок
+                    // переставал ловить нажатие, и перенос группы срывался
+                    // в резиновую рамку.
                     .children(self.render_multi_marks(page, size.height, zoom))
+                    .children(overlays)
                     .children(self.render_band_candidates(page, size.height, zoom))
                     .children(editing)
                     .children(guides)
@@ -6935,6 +7046,7 @@ impl Render for Viewer {
 
         self.sync_property_inputs(window, cx);
         self.sync_styles_rows(window, cx);
+        self.select_pasted(window, cx);
 
         let toolbar = self.render_toolbar(cx);
         let sidebar = self.render_sidebar(window, cx);
