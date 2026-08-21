@@ -1,5 +1,7 @@
 # PDFer
 
+![PDFer logo](logo-github.svg)
+
 Lightweight powerful PDF editor on Rust.
 
 Редактор PDF на Rust: GPUI для интерфейса, pdfium для разбора и растеризации.
