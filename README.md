@@ -1,8 +1,6 @@
-# PDFer
-
 <img src="logo-github.svg" alt="PDFer logo" width="240">
 
-Lightweight powerful PDF editor on Rust.
+PDFer — lightweight powerful PDF editor on Rust.
 
 Редактор PDF на Rust: GPUI для интерфейса, pdfium для разбора и растеризации.
 Задача — быстрая и точная ручная правка текста в документах, где автоматический
