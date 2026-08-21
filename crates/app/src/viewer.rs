@@ -2933,6 +2933,9 @@ impl Viewer {
         self.widgets = None;
         self.drag = None;
         self.guides.clear();
+        // Поле правки исчезло вместе с выделением, и клавиатура осталась ни
+        // при чём: следующий Ctrl+V уходил в никуда. Возвращаем её виду.
+        self.focus_root = true;
         // Предпросмотр показывал непринятую правку — без выделения он лжёт.
         // Текстуру снимаем явно: её копия живёт ещё и в атласе спрайтов gpui.
         if let Some((_, texture)) = self.doc.as_mut().and_then(|doc| doc.preview.take()) {
