@@ -1,6 +1,6 @@
 # PDFer
 
-![PDFer logo](logo-github.svg)
+<img src="logo-github.svg" alt="PDFer logo" width="240">
 
 Lightweight powerful PDF editor on Rust.
 
