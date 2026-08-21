@@ -75,11 +75,14 @@ impl BlockEdit {
         }
     }
 
-    fn apply(&self, document: &mut LoDocument) -> Result<()> {
+    /// Применяет правку; перенабор возвращает номер метки созданного блока.
+    fn apply(&self, document: &mut LoDocument) -> Result<Option<i64>> {
         match self {
-            BlockEdit::Rewrite(request) => rewrite_block(document, request).map(|_| ()),
-            BlockEdit::Transform(request) => transform_block(document, request).map(|_| ()),
-            BlockEdit::Erase(request) => erase_block(document, request).map(|_| ()),
+            BlockEdit::Rewrite(request) => {
+                rewrite_block(document, request).map(|outcome| Some(outcome.mark_id))
+            }
+            BlockEdit::Transform(request) => transform_block(document, request).map(|_| None),
+            BlockEdit::Erase(request) => erase_block(document, request).map(|_| None),
         }
     }
 }
@@ -141,6 +144,9 @@ pub enum RenderEvent {
     Edited {
         page: u32,
         outcome: Option<RewriteOutcome>,
+        /// Метки блоков, созданных этой правкой, — по ним вставка выделяет
+        /// именно свои блоки, а не похожие по рамке.
+        created: Vec<i64>,
     },
     /// Состав страниц изменился: вставка, удаление или поворот. Все кэши по
     /// номерам страниц обесценились — номера съехали.
@@ -605,7 +611,17 @@ fn worker(
                         Ok(outcome)
                     });
                 match result {
-                    Ok(outcome) => RenderEvent::Edited { page, outcome },
+                    Ok(outcome) => {
+                        let created = outcome
+                            .as_ref()
+                            .map(|o| vec![o.mark_id])
+                            .unwrap_or_default();
+                        RenderEvent::Edited {
+                            page,
+                            outcome,
+                            created,
+                        }
+                    }
                     Err(e) => RenderEvent::Failed {
                         page: Some(page),
                         message: format!("{e:#}"),
@@ -616,12 +632,16 @@ fn worker(
                 let page_number = edits.first().map(|edit| edit.page_number()).unwrap_or(1);
                 let page = page_number.saturating_sub(1);
                 preview = None;
-                let result = apply_batch(&path, &mut source, &edits, &mut history)
-                    .and_then(|()| refresh_overlay(&path, &mut source, &mut overlays, page_number));
+                let result =
+                    apply_batch(&path, &mut source, &edits, &mut history).and_then(|created| {
+                        refresh_overlay(&path, &mut source, &mut overlays, page_number)?;
+                        Ok(created)
+                    });
                 match result {
-                    Ok(()) => RenderEvent::Edited {
+                    Ok(created) => RenderEvent::Edited {
                         page,
                         outcome: None,
+                        created,
                     },
                     Err(e) => RenderEvent::Failed {
                         page: Some(page),
@@ -664,6 +684,7 @@ fn worker(
                     Ok(Some(StepOutcome::Content(page))) => RenderEvent::Edited {
                         page,
                         outcome: None,
+                        created: Vec::new(),
                     },
                     Ok(Some(StepOutcome::Pages(info))) => RenderEvent::PagesChanged { info },
                     Ok(None) => RenderEvent::Failed {
@@ -697,6 +718,7 @@ fn worker(
                     Ok(Some(StepOutcome::Content(page))) => RenderEvent::Edited {
                         page,
                         outcome: None,
+                        created: Vec::new(),
                     },
                     Ok(Some(StepOutcome::Pages(info))) => RenderEvent::PagesChanged { info },
                     Ok(None) => RenderEvent::Failed {
@@ -1005,10 +1027,10 @@ fn apply_batch(
     source: &mut Option<LoDocument>,
     edits: &[BlockEdit],
     history: &mut History,
-) -> Result<()> {
+) -> Result<Vec<i64>> {
     let document = structure(path, source)?;
     let Some(first) = edits.first() else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let page_number = first.page_number();
     let page_id = document
@@ -1023,9 +1045,12 @@ fn apply_batch(
     // действие. Пропущенное честно возвращается вызывающему. Откат при этом
     // остаётся одним шагом истории: записывается один снимок содержимого.
     let mut skipped = Vec::new();
+    let mut created = Vec::new();
     for edit in edits {
-        if let Err(e) = edit.apply(document) {
-            skipped.push(format!("{e:#}"));
+        match edit.apply(document) {
+            Ok(Some(mark)) => created.push(mark),
+            Ok(None) => {}
+            Err(e) => skipped.push(format!("{e:#}")),
         }
     }
     if skipped.len() == edits.len()
@@ -1050,7 +1075,7 @@ fn apply_batch(
             "часть блоков пачки пропущена"
         );
     }
-    Ok(())
+    Ok(created)
 }
 
 /// Что изменил шаг истории — вызывающему решать, какое событие слать.

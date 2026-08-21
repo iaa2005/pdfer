@@ -410,11 +410,6 @@ const SPREAD_GAP: f32 = 16.0;
 /// 48 МБ на тайл: пять-шесть страниц ещё умещаются в бюджет кэша разом.
 const MAX_TILE_PIXELS: f32 = 12_000_000.0;
 
-/// Насколько близко к заказанному месту должна лечь вставленная копия,
-/// чтобы считаться ею. Перенабор ставит строки по метрикам шрифта, и рамка
-/// сходится не буква в букву; но чужой блок рядом отстоит куда дальше.
-const PASTE_MATCH: f32 = 8.0;
-
 const PREFETCH_AHEAD: u32 = 4;
 const PREFETCH_BEHIND: u32 = 1;
 /// Сколько миниатюр готовится за пределами видимой части панели.
@@ -620,10 +615,11 @@ pub struct Viewer {
     page_origins_next: HashMap<u32, Vec<Point<Pixels>>>,
     /// Активный инструмент нижней панели.
     pub(crate) tool: Tool,
-    /// Куда легла вставленная копия: страница и рамки, которых ждём в свежем
-    /// разборе. Как только блоки придут, они станут выделенными — иначе
-    /// вставленное поверх чужого текста уже не выбрать мышью.
-    pending_paste: Option<(u32, Vec<Rect>)>,
+    /// Вставленная копия: страница и номера меток созданных блоков. Номера
+    /// присылает сама правка — как только придёт свежий разбор, блоки с ними
+    /// станут выделенными. Никаких догадок по рамкам: вставка точно знает,
+    /// что вставила.
+    pending_paste: Option<(u32, Vec<i64>)>,
     /// Открытый список выбора шрифта.
     pub(crate) font_picker: Option<FontPickerUi>,
     /// Открытый список готовых значений у числового поля панели.
@@ -869,7 +865,18 @@ impl Viewer {
                     };
                     previous.map(|(_, texture)| texture).into_iter().collect()
                 }
-                RenderEvent::Edited { page, outcome } => {
+                RenderEvent::Edited {
+                    page,
+                    outcome,
+                    created,
+                } => {
+                    // Вставка ждёт номера своих блоков — событие их принесло.
+                    if !created.is_empty()
+                        && let Some((wanted_page, marks)) = self.pending_paste.as_mut()
+                        && *wanted_page == page
+                    {
+                        *marks = created;
+                    }
                     match outcome {
                         Some(outcome) => tracing::info!(
                             page,
@@ -2856,11 +2863,9 @@ impl Viewer {
         let (dx, dy) = if same_page { (12.0, -12.0) } else { (0.0, 0.0) };
 
         let mut edits = Vec::new();
-        let mut pasted = Vec::new();
         for block in &clipboard {
             let b = block.bbox;
             let target = Rect::new(b.left + dx, b.bottom + dy, b.right + dx, b.top + dy);
-            pasted.push(target);
             let model = RichText::from_runs(block.runs.clone());
             let mut spans = model.to_spans(&block.base_family);
             // Документная гарнитура спана резолвится в ресурсах конкретной
@@ -2898,9 +2903,9 @@ impl Viewer {
             }));
         }
         doc.renderer.apply_edits(edits);
-        // Блоков ещё нет: страница перечитывается после правки. Запоминаем
-        // места, а выделим, когда придёт свежий разбор.
-        self.pending_paste = Some((page, pasted));
+        // Номера созданных блоков пришлёт событие правки; пока — пустой
+        // список как знак «вставка в пути».
+        self.pending_paste = Some((page, Vec::new()));
         self.set_status("Вставляю копию…", cx);
         cx.notify();
     }
@@ -2920,39 +2925,15 @@ impl Viewer {
             return;
         };
 
+        // Номера ещё не пришли — правка в пути, ждём её события.
+        if wanted.is_empty() {
+            return;
+        }
+        // Блоки узнаются по своим меткам: правка сама сказала, что создала.
+        // Разбор без этих меток — устаревший, ждём следующего.
         let mut found: Vec<MultiTarget> = Vec::new();
-        for rect in &wanted {
-            let centre = (
-                (rect.left + rect.right) / 2.0,
-                (rect.bottom + rect.top) / 2.0,
-            );
-            let nearest = blocks
-                .iter()
-                .filter(|block| {
-                    // Тот же блок дважды не берём: две копии рядом должны
-                    // выделиться каждая своя.
-                    !found
-                        .iter()
-                        .any(|target| target.page == page && target.bbox == block.bbox)
-                })
-                .min_by(|a, b| {
-                    let distance = |block: &pdfcore::Block| {
-                        let cx = (block.bbox.left + block.bbox.right) / 2.0 - centre.0;
-                        let cy = (block.bbox.bottom + block.bbox.top) / 2.0 - centre.1;
-                        cx * cx + cy * cy
-                    };
-                    distance(a).total_cmp(&distance(b))
-                });
-            // Разбор страницы после правки сбрасывается, но ответ на прежний
-            // запрос может прийти уже после — в нём копии ещё нет. Такой
-            // разбор узнаётся по тому, что рядом с заказанным местом ничего
-            // не легло: ждём следующего.
-            let nearest = nearest.filter(|block| {
-                let dx = (block.bbox.left + block.bbox.right) / 2.0 - centre.0;
-                let dy = (block.bbox.bottom + block.bbox.top) / 2.0 - centre.1;
-                dx * dx + dy * dy <= PASTE_MATCH * PASTE_MATCH
-            });
-            let Some(block) = nearest else {
+        for mark in &wanted {
+            let Some(block) = blocks.iter().find(|block| block.mark == Some(*mark)) else {
                 return;
             };
             found.push(MultiTarget {

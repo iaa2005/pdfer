@@ -196,6 +196,9 @@ pub struct RewriteOutcome {
     pub created_lines: usize,
     /// Итоговая высота набранного текста в пунктах.
     pub height: f32,
+    /// Номер метки, которой подписан созданный блок. По нему вставка находит
+    /// свои блоки в свежем разборе — без гаданий по рамкам.
+    pub mark_id: i64,
 }
 
 /// Имя, которым редактор помечает свои блоки в потоке содержимого.
@@ -1136,10 +1139,11 @@ pub fn rewrite_block(document: &mut Document, request: &BlockRewrite) -> Result<
     // q/Q: состояние графики к концу потока может быть любым. Метка вокруг —
     // имя блока в самом файле: по ней наложенные абзацы не склеиваются при
     // следующем разборе.
+    let mark_id = next_mark_id(&Content {
+        operations: operations.clone(),
+    });
     operations.push(mark_open(
-        next_mark_id(&Content {
-            operations: operations.clone(),
-        }),
+        mark_id,
         normalise_degrees(request.rotation),
         request.style_id,
         Some(request.align),
@@ -1333,6 +1337,7 @@ pub fn rewrite_block(document: &mut Document, request: &BlockRewrite) -> Result<
         cleared_ops: cleared,
         created_lines: created,
         height: created as f32 * line_height,
+        mark_id,
     })
 }
 
